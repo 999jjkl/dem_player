@@ -144,12 +144,6 @@ Data files are stored in the program directory:
 
 ---
 
-## License
-
-This project is licensed under the **GNU General Public License v3.0**. See the [LICENSE](LICENSE) file for details.
-
----
-
 ## Acknowledgements
 
 - Built with [PyQt6](https://riverbankcomputing.com/software/pyqt/) and [python-vlc](https://github.com/oaubert/python-vlc).
