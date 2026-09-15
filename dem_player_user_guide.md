@@ -1,4 +1,4 @@
-# dem_player User Guide (Version: 0.19.9)
+# dem_player User Guide (Version: 0.19.10)
 
 ## Quick Start & Installation
 To get your music playing, you will need to set up the Python environment and audio engines:
