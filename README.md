@@ -64,13 +64,23 @@ Place the following files in the same directory as `music_player.py`:
 | `FPT.ico` | Window / tray icon (optional) |
 | `background.png` | Background image (optional) |
 
+# Where to get 
+
+(https://github.com/tildearrow/furnace/releases)
+(https://www.videolan.org/vlc/)
+(https://www.un4seen.com/)
+(https://musical-artifacts.com/)
+(https://github.com/BtbN/FFmpeg-Builds/releases)
+(https://asap.sourceforge.net/)
+(https://zxtune.bitbucket.io/)
+
 ### Running
 
 ```bash
 python music_player.py
 ```
-
-On first launch, the player automatically migrates old data files (`data.json`, `data.txt`, `list.txt`, `love.txt`, `Cache.json`) to the new format (`settings.dpst`, `play_list.dppls`, `play_history_counts.dpphc`, `cache.dpch`). Old files are renamed to `*_old2.*`.
+On first launch, the player automatically create (`settings.dpst`, `play_list.dppls`, `play_history_counts.dpphc`, `cache.dpch`)
+If you previously used an older version, the player will automatically migrates old data files (`data.json`, `data.txt`, `list.txt`, `love.txt`, `Cache.json`) to the new format (`settings.dpst`, `play_list.dppls`, `play_history_counts.dpphc`, `cache.dpch`). Old files are renamed to `*_old2.*`.
 
 ---
 
