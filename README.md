@@ -1,6 +1,6 @@
 # dem_player
 
-**dem_player** is a feature-rich, keyboard-driven music player built with Python and PyQt6. It supports a wide range of audio formats through multiple playback engines (VLC, BASS, and native), offers extensive customization, and provides a sleek, borderless interface with a focus on usability.
+**dem_player** is a feature-rich, keyboard-driven music player built with Python and PySide6. It supports a wide range of audio formats through multiple playback engines (VLC, BASS, and native), offers extensive customization, and provides a sleek, borderless interface with a focus on usability.
 
 ---
 
@@ -30,13 +30,13 @@
 Install the required Python packages:
 
 ```bash
-pip install PyQt6 python-vlc
+python -m pip install PySide6 python-vlc
 ```
 
 Optional dependencies for enhanced features:
 
 ```bash
-pip install numpy sounddevice mutagen
+python -m pip install numpy sounddevice mutagen
 ```
 
 - `numpy` — for system audio spectrum analysis
@@ -156,7 +156,7 @@ Data files are stored in the program directory:
 
 ## Acknowledgements
 
-- Built with [PyQt6](https://riverbankcomputing.com/software/pyqt/) and [python-vlc](https://github.com/oaubert/python-vlc).
+- Built with [PySide6](https://pypi.org/project/PySide6/) and [python-vlc](https://github.com/oaubert/python-vlc).
 - Uses [VLC](https://www.videolan.org/vlc/) and [BASS](https://www.un4seen.com/) for audio playback.
 - Format conversion powered by [FFmpeg](https://ffmpeg.org/), [ASAP](https://asap.sourceforge.net/), [ZXTune](https://zxtune.bitbucket.io/), and [Furnace](https://github.com/tildearrow/furnace).
 
