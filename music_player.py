@@ -1,5 +1,6 @@
 import sys
 import os
+import shutil
 
 # --- VLC DLL bootstrap: works for both script and frozen exe ---
 if getattr(sys, 'frozen', False):
@@ -41,11 +42,12 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, QEvent, QObject, QThread, Signal, QMetaObject, Slot, QPoint
 from PySide6.QtGui import (
     QFont, QKeyEvent, QFontDatabase, QPainter, QColor, QPen, QFontMetrics,
-    QPixmap, QIcon, QAction, QGuiApplication, QTextCursor, QTextCharFormat
+    QPixmap, QIcon, QAction, QGuiApplication, QTextCursor, QTextCharFormat,
+    QImage, QImageReader
 )
 
-APP_VERSION = "0.19.11"
-# 0.19.11: fixed VLC end-of-track detection for SINGLE/LIST loop under PySide6
+APP_VERSION = "0.20"
+# 0.20: added custom PNG background image support (<=5MB, <=3840px)
 
 QWIDGETSIZE_MAX = 16777215
 
@@ -971,6 +973,12 @@ PLAYLIST_FILE = data_path("play_list.dppls")
 HISTORY_FILE = data_path("play_history_counts.dpphc")
 CACHE_FILE = data_path("cache.dpch")
 
+# ---------- custom background image ----------
+BACKGROUND_DIR = os.path.join(app_dir(), "Background")
+CUSTOM_BACKGROUND_FILENAME = "custom_background.png"
+BG_MAX_BYTES = 5 * 1024 * 1024      # 5 MB
+BG_MAX_DIM = 3840                   # longest side in pixels
+
 OLD_CACHE_JSON = data_path("Cache.json")
 OLD_CACHE_ALT = data_path("Cache_old2.json")
 
@@ -1005,6 +1013,7 @@ DEFAULT_SETTINGS = {
     "volume": 50,
     "window_mode": 0,
     "background_mode": "transparent",
+    "custom_background_path": "",
     "always_on_top": False,
     "time_format": TIME_FORMAT_MM_SS_CC,
     "output_device": "",
@@ -1293,7 +1302,8 @@ def migrate_old_files_if_needed():
                     "window_mode", "background_mode", "always_on_top",
                     "show_audio_level", "log_level", "time_format",
                     "output_device", "vlc_device", "bass_device",
-                    "show_advanced_audio", "engine_mode"):
+                    "show_advanced_audio", "engine_mode",
+                    "custom_background_path"):
             if key in old_data:
                 settings[key] = old_data[key]
     else:
@@ -1722,6 +1732,7 @@ class MusicRoom(QMainWindow):
         self.initial_volume = settings.get("volume", 50)
         self.window_mode = settings.get("window_mode", 0)
         self.background_mode = settings.get("background_mode", "transparent")
+        self.custom_background_path = settings.get("custom_background_path", "") or ""
         self.is_always_on_top = settings.get("always_on_top", False)
         self.time_format = settings.get("time_format", TIME_FORMAT_MM_SS_CC)
         if self.time_format not in (TIME_FORMAT_MM_SS, TIME_FORMAT_MM_SS_CC):
@@ -1836,6 +1847,8 @@ class MusicRoom(QMainWindow):
             pass
 
         self.bg_pixmap = None
+        self._bg_scaled = None
+        self._bg_scaled_for = None
 
         self.folder_cache = load_cache()
         self._cache_dirty = False
@@ -2157,6 +2170,7 @@ class MusicRoom(QMainWindow):
             "volume": self.volume_text.value() if hasattr(self, "volume_text") else self.initial_volume,
             "window_mode": self.window_mode,
             "background_mode": self.background_mode,
+            "custom_background_path": getattr(self, "custom_background_path", ""),
             "always_on_top": self.is_always_on_top,
             "time_format": self.time_format,
             "output_device": getattr(self, "output_device", ""),
@@ -2426,9 +2440,16 @@ class MusicRoom(QMainWindow):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        if self.background_mode == "image" and self.bg_pixmap and not self.bg_pixmap.isNull():
-            scaled = self.bg_pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation)
-            painter.drawPixmap(0, 0, scaled)
+        if (self.background_mode == "image"
+                and self.bg_pixmap and not self.bg_pixmap.isNull()):
+            cur = self.size()
+            if self._bg_scaled is None or self._bg_scaled_for != cur:
+                self._bg_scaled = self.bg_pixmap.scaled(
+                    cur,
+                    Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                    Qt.TransformationMode.SmoothTransformation)
+                self._bg_scaled_for = cur
+            painter.drawPixmap(0, 0, self._bg_scaled)
             painter.fillRect(self.rect(), QColor(0, 0, 0, 100))
         if self.has_custom_border:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -2439,18 +2460,24 @@ class MusicRoom(QMainWindow):
         super().paintEvent(event)
 
     def apply_background_image(self):
+        self.bg_pixmap = None
+        self._bg_scaled = None
+        self._bg_scaled_for = None
+
         if self.background_mode == "image":
-            bg_path = resource_path("background.png")
-            if os.path.isfile(bg_path):
-                self.bg_pixmap = QPixmap(bg_path)
-                if self.bg_pixmap.isNull():
-                    self.bg_pixmap = None
-                    self.background_mode = "solid"
-            else:
-                self.bg_pixmap = None
+            custom_path = getattr(self, "custom_background_path", "") or ""
+            if custom_path and os.path.isfile(custom_path):
+                pm = QPixmap(custom_path)
+                if not pm.isNull():
+                    self.bg_pixmap = pm
+            if self.bg_pixmap is None:
+                builtin = resource_path("background.png")
+                if os.path.isfile(builtin):
+                    pm = QPixmap(builtin)
+                    if not pm.isNull():
+                        self.bg_pixmap = pm
+            if self.bg_pixmap is None:
                 self.background_mode = "solid"
-        else:
-            self.bg_pixmap = None
 
         if self.background_mode == "transparent":
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -2463,6 +2490,7 @@ class MusicRoom(QMainWindow):
                 self.centralWidget().setStyleSheet("background-color: transparent;")
         if hasattr(self, 'right_frame'):
             self.right_frame.setStyleSheet("background-color: transparent;")
+        self.update()
 
     # ================== SETTINGS UI ==================
     def update_settings_list(self):
@@ -2485,7 +2513,15 @@ class MusicRoom(QMainWindow):
             self.settings_list.addItem("Advanced Audio >>")
         count_state = "Y" if self.show_play_counts else "N"
         self.settings_list.addItem(f"Show Play Counts                     [{count_state}]")
-        self.settings_list.addItem(f"Background                           [{self.background_mode}]")
+        # Background image entries (order matters: specific before generic)
+        self.settings_list.addItem("Background Image...")
+        self.settings_list.addItem("Clear Background Image")
+        _bg_state = self.background_mode
+        if (self.background_mode == "image"
+                and getattr(self, "custom_background_path", "")
+                and os.path.isfile(self.custom_background_path)):
+            _bg_state = "image (custom)"
+        self.settings_list.addItem(f"Background                           [{_bg_state}]")
         log_state = "Y" if LOG_ENABLED else "N"
         self.settings_list.addItem(f"Log Save                             [{log_state}]")
         dur_state = "Y" if self.show_duration else "N"
@@ -2536,6 +2572,10 @@ class MusicRoom(QMainWindow):
             self.pick_bass_device()
         elif text.startswith("Show Play Counts"):
             self.toggle_show_play_counts()
+        elif text.startswith("Background Image..."):
+            self.pick_background_image()
+        elif text.startswith("Clear Background Image"):
+            self.clear_background_image()
         elif text.startswith("Background"):
             self.cycle_background_mode()
         elif text.startswith("Log Save"):
@@ -2558,7 +2598,18 @@ class MusicRoom(QMainWindow):
             if m:
                 idx = int(m.group(1))
                 if 0 <= idx < len(self.source_paths):
-                    removed = self.source_paths.pop(idx)
+                    removed = self.source_paths[idx]
+                    reply = QMessageBox.question(
+                        self,
+                        "Confirm Removal",
+                        f"Remove this music folder from the list?\n\n{removed}\n\n"
+                        f"(Removed from the list only. Files on disk are NOT deleted.)",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No
+                    )
+                    if reply != QMessageBox.StandardButton.Yes:
+                        return
+                    self.source_paths.pop(idx)
                     self._save_playlist()
                     self.track_status.setText(f"Removed: {removed}")
                     log(f"[Settings] Removed source folder: {removed}", 20)
@@ -2628,6 +2679,13 @@ class MusicRoom(QMainWindow):
                 self.audio_level_source = "file"
                 self.loop_mode = 0
                 self.background_mode = "transparent"
+                self.custom_background_path = ""
+                try:
+                    _p = os.path.join(BACKGROUND_DIR, CUSTOM_BACKGROUND_FILENAME)
+                    if os.path.exists(_p):
+                        os.remove(_p)
+                except Exception as e:
+                    log(f"[BG] reset remove failed: {e}", 30)
                 self.is_always_on_top = False
                 self.time_format = TIME_FORMAT_MM_SS_CC
                 self.output_device = ""
@@ -2740,6 +2798,9 @@ class MusicRoom(QMainWindow):
         lines.append(f"theme          : {self.THEMES[self.current_theme_index][0]}")
         lines.append(f"time format    : {self.time_format}")
         lines.append(f"background     : {self.background_mode}")
+        _custom_ok = bool(getattr(self, "custom_background_path", "")) \
+                     and os.path.isfile(self.custom_background_path)
+        lines.append(f"custom bg      : {'yes' if _custom_ok else 'no'}")
         lines.append(f"always on top  : {self.is_always_on_top}")
         lines.append(f"show duration  : {self.show_duration}")
         lines.append(f"show cover art : {self.show_cover_art}")
@@ -2756,17 +2817,146 @@ class MusicRoom(QMainWindow):
         return "\n".join(lines)
 
     def cycle_background_mode(self):
+        has_img = (
+            (getattr(self, "custom_background_path", "")
+             and os.path.isfile(self.custom_background_path))
+            or os.path.isfile(resource_path("background.png"))
+        )
         if self.background_mode == "transparent":
             self.background_mode = "solid"
         elif self.background_mode == "solid":
-            if os.path.isfile(resource_path("background.png")):
-                self.background_mode = "image"
-            else:
-                self.background_mode = "transparent"
+            self.background_mode = "image" if has_img else "transparent"
         else:
             self.background_mode = "transparent"
         self.apply_background_image()
         self._save_settings()
+
+    def pick_background_image(self):
+        src, _ = QFileDialog.getOpenFileName(
+            self, "Select Background Image (PNG only, <= 5MB)", "", "PNG Image (*.png)")
+        if not src:
+            return
+
+        if os.path.splitext(src)[1].lower() != ".png":
+            QMessageBox.warning(self, "Cannot Use This Image", "Only PNG files are accepted")
+            return
+
+        try:
+            src_size = os.path.getsize(src)
+        except OSError as e:
+            QMessageBox.warning(self, "Cannot Use This Image", f"Cannot read file: {e}")
+            return
+        if src_size > BG_MAX_BYTES:
+            QMessageBox.warning(self, "Cannot Use This Image", "PNG file exceeds 5MB")
+            return
+
+        reader = QImageReader(src)
+        reader.setAutoTransform(True)
+        if not reader.canRead():
+            QMessageBox.warning(self, "Cannot Use This Image", "Not a valid PNG image")
+            return
+        size = reader.size()
+        if not size.isValid() or size.width() <= 0 or size.height() <= 0:
+            QMessageBox.warning(self, "Cannot Use This Image", "Not a valid PNG image")
+            return
+
+        try:
+            os.makedirs(BACKGROUND_DIR, exist_ok=True)
+        except OSError as e:
+            QMessageBox.warning(self, "Cannot Use This Image", f"Cannot create directory: {e}")
+            return
+
+        dst = os.path.join(BACKGROUND_DIR, CUSTOM_BACKGROUND_FILENAME)
+        tmp = dst + ".tmp"
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+
+        w, h = size.width(), size.height()
+        need_resize = (w > BG_MAX_DIM) or (h > BG_MAX_DIM)
+
+        if need_resize:
+            img = reader.read()
+            if img.isNull():
+                QMessageBox.warning(self, "Cannot Use This Image", "PNG decode failed")
+                return
+            if w >= h:
+                new_w, new_h = BG_MAX_DIM, max(1, int(round(h * BG_MAX_DIM / w)))
+            else:
+                new_h, new_w = BG_MAX_DIM, max(1, int(round(w * BG_MAX_DIM / h)))
+            img = img.scaled(new_w, new_h,
+                             Qt.AspectRatioMode.KeepAspectRatio,
+                             Qt.TransformationMode.SmoothTransformation)
+            if not img.save(tmp, "PNG"):
+                QMessageBox.warning(self, "Cannot Use This Image", "PNG save failed")
+                return
+        else:
+            try:
+                shutil.copyfile(src, tmp)
+            except Exception as e:
+                QMessageBox.warning(self, "Cannot Use This Image", f"Copy failed: {e}")
+                return
+
+        try:
+            final_size = os.path.getsize(tmp)
+        except OSError:
+            final_size = -1
+        if final_size < 0 or final_size > BG_MAX_BYTES:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            QMessageBox.warning(self, "Cannot Use This Image", "PNG file exceeds 5MB")
+            return
+
+        try:
+            os.replace(tmp, dst)
+        except OSError as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            QMessageBox.warning(self, "Cannot Use This Image", f"Replace failed: {e}")
+            return
+
+        self.custom_background_path = dst
+        if self.background_mode != "image":
+            self.background_mode = "image"
+        self.apply_background_image()
+        self.update()
+        self._save_settings()
+        self.track_status.setText(
+            f"Background: {os.path.basename(src)} ({final_size/1024:.0f} KB"
+            + (", resized" if need_resize else "") + ")")
+        log(f"[BG] set custom background: {src} -> {dst} "
+            f"({final_size} bytes, resized={need_resize})", 20)
+
+    def clear_background_image(self):
+        _p = os.path.join(BACKGROUND_DIR, CUSTOM_BACKGROUND_FILENAME)
+        if not getattr(self, "custom_background_path", "") and not os.path.isfile(_p):
+            QMessageBox.information(self, "Info", "No custom background image is set")
+            return
+        reply = QMessageBox.question(
+            self, "Confirm", "Clear the custom background image?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            if os.path.exists(_p):
+                os.remove(_p)
+        except Exception as e:
+            log(f"[BG] remove failed: {e}", 30)
+
+        self.custom_background_path = ""
+        self.apply_background_image()
+        self.update()
+        self._save_settings()
+        self.track_status.setText("Custom background cleared")
+        log("[BG] custom background cleared", 20)
 
     def toggle_audio_level_mode(self):
         self.audio_level_mode = "volume" if self.audio_level_mode == "all" else "all"
