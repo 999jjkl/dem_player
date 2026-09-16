@@ -8,7 +8,7 @@ I. Quick Start
    pip install PyQt6 python-vlc numpy sounddevice mutagen
 
    Required:
-   - PyQt6
+   - PyQt6(*in new vision use pyside6)
    - python-vlc
 
    Optional:
