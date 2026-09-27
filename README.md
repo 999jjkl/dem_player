@@ -78,7 +78,7 @@ Useful links:
 
 ### Running
 ```bash
-python music_player.py
+python main.py
 ```
 
 On first launch, the app creates data files such as:
@@ -217,7 +217,7 @@ python -m pip install numpy sounddevice mutagen
 
 ### 執行方式
 ```bash
-python music_player.py
+python main.py
 ```
 
 首次啟動時會建立：
