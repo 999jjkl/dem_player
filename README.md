@@ -296,6 +296,3 @@ python music_player.py
 
 When I was playing Touhou 5, I really liked the Musicroom-style UI layout, so I made `dem_player` as a compact, keyboard-driven player for local music.
 
-## 為什麼做這個
-
-當我在玩 Touhou 5 時，我很喜歡 Musicroom 那種 UI 風格，所以我做了 `dem_player`，希望它成為一個簡潔、快速、以鍵盤為中心的本地音樂播放器。
