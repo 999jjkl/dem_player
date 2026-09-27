@@ -48,7 +48,7 @@ python -m pip install numpy sounddevice mutagen
 - `mutagen` — metadata and cover art
 
 ### Sidecar Tools
-Place the following files next to `music_player.py` or the packaged `.exe`:
+Place the following files next to `main.py` or the packaged `.exe`:
 
 | File / Tool | Purpose |
 |-------------|---------|
@@ -139,7 +139,7 @@ Maintenance actions include:
 - reset all settings
 
 ### Data and Logs
-- Running directly from Python: data folder is beside `music_player.py`
+- Running directly from Python: data folder is beside `main.py`
 - Running packaged `.exe`: data folder is beside the executable
 - Logs are kept under:
   `data/logs/player_data_%H.%M.%S-%d.%m.%Y.log`
@@ -277,7 +277,7 @@ python main.py
 - 重設所有設定
 
 ### 資料與日誌
-- 直接執行 Python：資料位於 `music_player.py` 同目錄下的 `data/`
+- 直接執行 Python：資料位於 `main.py` 同目錄下的 `data/`
 - 打包成 `.exe`：資料位於執行檔同目錄下
 - 日誌位置：
   `data/logs/player_data_%H.%M.%S-%d.%m.%Y.log`
