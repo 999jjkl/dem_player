@@ -62,9 +62,11 @@ DEFAULT_SETTINGS = {
     "loop_mode": 0,
     "volume": 50,
     "window_mode": 0,
-    "background_mode": "transparent",
+    "background_mode": "aero",
+    "aero_opacity": 40,
     "custom_background_path": "",
     "always_on_top": False,
+    "allow_screensaver": False,
     "time_format": TIME_FORMAT_MM_SS_CC,
     "output_device": "",
     "show_advanced_audio": False,
@@ -139,6 +141,16 @@ def load_settings():
     data["version"] = APP_VERSION
     if data.get("time_format") not in (TIME_FORMAT_MM_SS, TIME_FORMAT_MM_SS_CC):
         data["time_format"] = TIME_FORMAT_MM_SS_CC
+    # transparent (see-through) and aero (frosted) are different modes.
+    if data.get("background_mode") not in ("transparent", "aero", "solid", "image"):
+        data["background_mode"] = "aero"
+    if data.get("loop_mode") not in (0, 1, 2, 3):
+        data["loop_mode"] = 0
+    try:
+        data["aero_opacity"] = max(0, min(100, int(data.get("aero_opacity", 40))))
+    except (TypeError, ValueError):
+        data["aero_opacity"] = 40
+    data["allow_screensaver"] = bool(data.get("allow_screensaver", False))
     return data
 
 
