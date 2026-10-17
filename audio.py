@@ -3,16 +3,18 @@ from __future__ import annotations
 
 import array
 import os
+import re
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import threading
 import wave
 import ctypes
 from abc import ABC, abstractmethod
 
-from core import app_dir, log, resource_path, resource_candidates, subprocess_hidden_kwargs
+from core import app_dir, log, resource_path, resource_candidates, subprocess_hidden_kwargs, same_path
 
 SAMPLE_RATE = 44100
 CHANNELS = 2
@@ -152,56 +154,115 @@ def shutil_which(cmd: str) -> str | None:
 
 
 def probe_openmpt() -> str:
-    lib = _openmpt_lib()
-    if lib is not None:
-        return getattr(lib, "_name", "") or "libopenmpt"
+    """Prefer the exe path. Do not CDLL-load libopenmpt just to say it exists."""
     p = _openmpt123_bin()
-    return p or ""
+    if p:
+        return p
+    for n in ("libopenmpt.dll", "openmpt.dll"):
+        cand = resource_path(n)
+        if os.path.isfile(cand):
+            return cand
+    return ""
 
 
 def probe_fluidsynth() -> str:
+    """File check only. Do not import pyfluidsynth here (that slows startup)."""
     p = _fluidsynth_bin()
     if p:
         return p
-    dll = _preload_fluidsynth_dll()
-    if dll:
-        return dll
-    try:
-        import fluidsynth  # noqa: F401
-        return "pyfluidsynth"
-    except Exception:
-        return ""
+    for n in ("libfluidsynth-3.dll", "libfluidsynth.dll", "fluidsynth.dll"):
+        cand = resource_path(n)
+        if os.path.isfile(cand):
+            return cand
+    return ""
 
 
 def probe_soundfont() -> str:
     return _soundfont_path() or ""
 
 
+_DEVICE_CACHE = None
+_DEVICE_CACHE_AT = 0.0
+_GENERIC_DEV = re.compile(r"^(device|output)\s*\d+$", re.IGNORECASE)
+
+
+def _wasapi_output_names():
+    """Real endpoint names (Speakers, Headphones...). sounddevice is imported only here."""
+    try:
+        import sounddevice as sd
+        apis = list(sd.query_hostapis())
+        names = []
+        for d in sd.query_devices():
+            if int(d.get("max_output_channels") or 0) < 1:
+                continue
+            host = str(apis[int(d["hostapi"])]["name"])
+            if "WASAPI" in host.upper():
+                names.append(str(d["name"]))
+        return names
+    except Exception as e:
+        log(f"[Audio] output names: {e}", 30)
+        return []
+
+
 def list_output_devices():
-    """Return [(id_str, name), ...]. id_str is the device name (stable enough to persist)."""
+    """Return [(id, label), ...]. id is the miniaudio index so device0 still maps."""
+    global _DEVICE_CACHE, _DEVICE_CACHE_AT
+    now = time.monotonic()
+    if _DEVICE_CACHE is not None and (now - _DEVICE_CACHE_AT) < 8:
+        return list(_DEVICE_CACHE)
     results = []
     if not HAS_MINIAUDIO:
         return results
     try:
         devices = miniaudio.Devices()
-        for i, d in enumerate(devices.get_playbacks()):
-            name = getattr(d, "name", None) or f"Device {i}"
-            results.append((name, name))
+        playbacks = list(devices.get_playbacks())
     except Exception as e:
         log(f"[Audio] device list failed: {e}", 30)
-    return results
+        return results
+    friendly = None
+    for i, d in enumerate(playbacks):
+        raw = getattr(d, "name", "") or ""
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        raw = str(raw).strip()
+        label = raw
+        if (not label) or _GENERIC_DEV.match(label):
+            if friendly is None:
+                friendly = _wasapi_output_names()
+            if i < len(friendly):
+                label = friendly[i]
+            else:
+                label = f"Output {i}"
+        results.append((str(i), label))
+    _DEVICE_CACHE = results
+    _DEVICE_CACHE_AT = now
+    return list(results)
 
 
 def _find_device_id(name: str):
     if not name or not HAS_MINIAUDIO:
         return None
     try:
-        devices = miniaudio.Devices()
-        for d in devices.get_playbacks():
-            if getattr(d, "name", "") == name:
-                return d.id
+        devices = list(miniaudio.Devices().get_playbacks())
     except Exception:
-        pass
+        return None
+    stored = str(name).strip()
+    if stored.isdigit():
+        i = int(stored)
+        if 0 <= i < len(devices):
+            return devices[i].id
+        return None
+    for d in devices:
+        raw = getattr(d, "name", "") or ""
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", "replace")
+        if str(raw) == stored:
+            return d.id
+    for did, label in list_output_devices():
+        if stored == label and str(did).isdigit():
+            i = int(did)
+            if 0 <= i < len(devices):
+                return devices[i].id
     return None
 
 
@@ -433,7 +494,7 @@ def render_midi_pyfluidsynth(smf_bytes: bytes, sf2: str) -> bytes | None:
         return None
 
     try:
-        fs = fluidsynth.Synth(samplerate=float(SAMPLE_RATE), gain=0.4)
+        fs = fluidsynth.Synth(samplerate=float(SAMPLE_RATE), gain=1.2)
     except Exception as e:
         log(f"[fluidsynth] Synth(): {e}", 40)
         return None
@@ -552,6 +613,24 @@ class AudioBackend(ABC):
 
 
 # ---------- miniaudio PCM pump ----------
+_NP = None
+
+
+def _numpy():
+    """Lazy numpy. Used so the audio callback does not loop samples in Python."""
+    global _NP
+    if _NP is False:
+        return None
+    if _NP is None:
+        try:
+            import numpy as np
+            _NP = np
+        except Exception:
+            _NP = False
+            return None
+    return _NP
+
+
 class MiniaudioBackend(AudioBackend):
     """Direct decode+play for WAV/MP3/FLAC/OGG (and anything miniaudio can open)."""
 
@@ -559,6 +638,7 @@ class MiniaudioBackend(AudioBackend):
         self.device_name = device_name
         self.on_end = on_end
         self._device = None
+        self._device_rate = 0
         self._lock = threading.Lock()
         self._paused = False
         self._stopped = True
@@ -579,7 +659,7 @@ class MiniaudioBackend(AudioBackend):
             self.last_error = "miniaudio not installed (pip install miniaudio)"
             log("[miniaudio] not installed", 40)
             return False
-        self._stop_device()
+        self._stop_device(close=False)
         if not os.path.isfile(filepath):
             self.last_error = f"missing file: {filepath}"
             log(f"[miniaudio] missing {filepath}", 30)
@@ -630,23 +710,96 @@ class MiniaudioBackend(AudioBackend):
             self.last_error = "empty stream"
             return False
 
-        device_id = _find_device_id(self.device_name)
-        try:
-            self._device = miniaudio.PlaybackDevice(
-                output_format=miniaudio.SampleFormat.SIGNED16,
-                nchannels=CHANNELS,
-                sample_rate=self._sample_rate,
-                device_id=device_id,
-            )
-            self._device.start(wrapped)
-        except Exception as e:
-            self.last_error = f"device: {e}"
-            log(f"[miniaudio] PlaybackDevice failed: {e}", 40)
-            self._device = None
+        if not self._start_device(wrapped):
             return False
         self.last_error = ""
         log(f"[miniaudio] playing {filepath} start_ms={start_ms}", 20)
         return True
+
+    def _start_device(self, wrapped) -> bool:
+        """Reuse the open device when the sample rate matches. Creating one is the ~500ms hit."""
+        rate = int(self._sample_rate or SAMPLE_RATE)
+        if self._device is not None and self._device_rate not in (0, rate):
+            self._stop_device(close=True)
+            self._stopped = False
+
+        def _open():
+            device_id = _find_device_id(self.device_name)
+            dev = miniaudio.PlaybackDevice(
+                output_format=miniaudio.SampleFormat.SIGNED16,
+                nchannels=CHANNELS,
+                sample_rate=rate,
+                device_id=device_id,
+            )
+            dev.start(wrapped)
+            self._device = dev
+            self._device_rate = rate
+
+        try:
+            if self._device is None:
+                _open()
+            else:
+                self._device.start(wrapped)
+            return True
+        except Exception as e:
+            log(f"[miniaudio] reuse failed ({e}), reopening", 30)
+            self._stop_device(close=True)
+            self._stopped = False
+            try:
+                _open()
+                return True
+            except Exception as e2:
+                self.last_error = f"device: {e2}"
+                log(f"[miniaudio] PlaybackDevice failed: {e2}", 40)
+                self._device = None
+                self._device_rate = 0
+                return False
+
+    def _shape_chunk(self, samples, vol):
+        """Meter the dry signal, then apply volume. Level stays up when volume is 0."""
+        if not isinstance(samples, array.array):
+            samples = array.array("h", samples)
+        n = len(samples)
+        if n <= 0:
+            self._last_amp = 0.0
+            self._pcm_chunk = None
+            return samples
+        np = _numpy()
+        if np is not None:
+            dry = np.frombuffer(samples, dtype=np.int16)
+            take = dry[:2048]
+            self._pcm_chunk = take.copy()
+            self._last_amp = min(1.0, float(np.max(np.abs(take))) / 32768.0) if take.size else 0.0
+            if vol >= 0.999:
+                return samples
+            if vol <= 0.001:
+                return array.array("h", bytes(n * 2))
+            scaled = np.clip(dry.astype(np.float32) * float(vol), -32768, 32767).astype(np.int16)
+            return array.array("h", scaled.tobytes())
+        step = max(1, n // 48)
+        peak = 0
+        for i in range(0, n, step):
+            a = samples[i]
+            if a < 0:
+                a = -a
+            if a > peak:
+                peak = a
+        self._last_amp = min(1.0, peak / 32768.0)
+        self._pcm_chunk = samples
+        if vol >= 0.999:
+            return samples
+        if vol <= 0.001:
+            return array.array("h", bytes(n * 2))
+        amp = int(vol * 256)
+        scaled = array.array("h", bytes(n * 2))
+        for i, s in enumerate(samples):
+            v = (s * amp) >> 8
+            if v > 32767:
+                v = 32767
+            elif v < -32768:
+                v = -32768
+            scaled[i] = v
+        return scaled
 
     def _wrap_stream(self, stream):
         paused_silence = array.array("h", [0] * (1024 * CHANNELS))
@@ -682,28 +835,9 @@ class MiniaudioBackend(AudioBackend):
                         self._ended = True
                         self._fire_end()
                         return
-                    samples = chunk if isinstance(chunk, array.array) else array.array("h", chunk)
-                    if vol < 0.999:
-                        scaled = array.array("h")
-                        amp = int(vol * 256)
-                        for s in samples:
-                            v = (s * amp) >> 8
-                            if v > 32767:
-                                v = 32767
-                            elif v < -32768:
-                                v = -32768
-                            scaled.append(v)
-                        samples = scaled
+                    samples = self._shape_chunk(chunk, vol)
                     n = len(samples)
                     if n:
-                        step = max(1, n // 64)
-                        peak = 0
-                        for i in range(0, n, step):
-                            a = abs(samples[i])
-                            if a > peak:
-                                peak = a
-                        self._last_amp = min(1.0, peak / 32768.0)
-                        self._pcm_chunk = samples
                         self._frames_played += n // CHANNELS
                     num_frames = yield samples
             except GeneratorExit:
@@ -722,25 +856,30 @@ class MiniaudioBackend(AudioBackend):
             except Exception as e:
                 log(f"[miniaudio] on_end error: {e}", 30)
 
-    def _stop_device(self):
+    def _stop_device(self, close=True):
         with self._lock:
             self._stopped = True
             self._paused = False
-        if self._device is not None:
+        dev = self._device
+        if dev is not None:
             try:
-                self._device.stop()
+                dev.stop()
             except Exception:
                 pass
-            try:
-                self._device.close()
-            except Exception:
-                pass
-            self._device = None
+            if close:
+                try:
+                    dev.close()
+                except Exception:
+                    pass
+                self._device = None
+                self._device_rate = 0
         self._ended = False
-        self._last_amp = 0.0
+        if close:
+            self._last_amp = 0.0
 
     def stop(self):
-        self._stop_device()
+        # Keep the device open so the next play does not pay WASAPI startup.
+        self._stop_device(close=False)
 
     def pause(self):
         with self._lock:
@@ -784,12 +923,30 @@ class MiniaudioBackend(AudioBackend):
 
     def get_spectrum_bands(self):
         samples = self._pcm_chunk
-        if not samples or len(samples) < 64:
+        if samples is None:
             return (0.0, 0.0, 0.0)
-        n = min(len(samples), 2048)
+        try:
+            n = len(samples)
+        except Exception:
+            return (0.0, 0.0, 0.0)
+        if n < 64:
+            return (0.0, 0.0, 0.0)
+        np = _numpy()
+        if np is not None:
+            arr = np.asarray(samples, dtype=np.float32).reshape(-1) / 32768.0
+            n = int(arr.size)
+            third = max(1, n // 3)
+
+            def rms(part):
+                if part.size == 0:
+                    return 0.0
+                return float(min(1.0, (float(np.mean(part * part)) ** 0.5) * 2))
+
+            return (rms(arr[:third]), rms(arr[third:third * 2]), rms(arr[third * 2:]))
+        n = min(n, 2048)
         third = n // 3
 
-        def rms(start, end):
+        def rms_py(start, end):
             s = 0
             c = 0
             for i in range(start, end, 2):
@@ -800,10 +957,10 @@ class MiniaudioBackend(AudioBackend):
                 return 0.0
             return min(1.0, (s / c) ** 0.5 * 2)
 
-        return (rms(0, third), rms(third, third * 2), rms(third * 2, n))
+        return (rms_py(0, third), rms_py(third, third * 2), rms_py(third * 2, n))
 
     def free(self):
-        self.stop()
+        self._stop_device(close=True)
 
 
 class FFmpegBackend(MiniaudioBackend):
@@ -815,7 +972,7 @@ class FFmpegBackend(MiniaudioBackend):
 
     def play(self, filepath, start_ms=0):
         # If this is a seek on the WAV we already rendered, do not re-decode.
-        if self._tmp and os.path.isfile(self._tmp) and os.path.abspath(filepath) == os.path.abspath(self._tmp):
+        if self._tmp and os.path.isfile(self._tmp) and same_path(filepath, self._tmp):
             return super().play(filepath, start_ms=start_ms)
         wav = self._decode_to_wav(filepath)
         if not wav:
@@ -828,7 +985,7 @@ class FFmpegBackend(MiniaudioBackend):
             self._tmp = wav
         else:
             _cleanup_file(wav)
-        if old and old != wav:
+        if old and not same_path(old, wav):
             _cleanup_file(old)
         return ok
 
@@ -856,7 +1013,7 @@ class OpenMptBackend(MiniaudioBackend):
         self._tmp = None
 
     def play(self, filepath, start_ms=0):
-        if self._tmp and os.path.isfile(self._tmp) and os.path.abspath(filepath) == os.path.abspath(self._tmp):
+        if self._tmp and os.path.isfile(self._tmp) and same_path(filepath, self._tmp):
             return super().play(filepath, start_ms=start_ms)
         wav = self._render(filepath)
         if not wav:
@@ -868,7 +1025,7 @@ class OpenMptBackend(MiniaudioBackend):
             self._tmp = wav
         else:
             _cleanup_file(wav)
-        if old and old != wav:
+        if old and not same_path(old, wav):
             _cleanup_file(old)
         return ok
 
@@ -1060,7 +1217,7 @@ class FluidSynthBackend(MiniaudioBackend):
         self._mid_tmp = None
 
     def play(self, filepath, start_ms=0):
-        if self._tmp and os.path.isfile(self._tmp) and os.path.abspath(filepath) == os.path.abspath(self._tmp):
+        if self._tmp and os.path.isfile(self._tmp) and same_path(filepath, self._tmp):
             return super().play(filepath, start_ms=start_ms)
         wav = self._render_midi(filepath)
         if not wav:
@@ -1072,7 +1229,7 @@ class FluidSynthBackend(MiniaudioBackend):
             self._tmp = wav
         else:
             _cleanup_file(wav)
-        if old and old != wav:
+        if old and not same_path(old, wav):
             _cleanup_file(old)
         return ok
 
@@ -1125,9 +1282,9 @@ class FluidSynthBackend(MiniaudioBackend):
             except Exception:
                 pass
             cmds = [
-                [exe, "-ni", "-a", "file", "-q", "-g", "0.5", "-F", tmp, "-r", str(SAMPLE_RATE), sf2, mid],
-                [exe, "-a", "file", "-F", tmp, "-r", str(SAMPLE_RATE), "-ni", sf2, mid],
-                [exe, "-ni", "-q", "-g", "0.5", "-F", tmp, "-r", str(SAMPLE_RATE), sf2, mid],
+                [exe, "-ni", "-a", "file", "-q", "-g", "1.5", "-F", tmp, "-r", str(SAMPLE_RATE), sf2, mid],
+                [exe, "-a", "file", "-F", tmp, "-r", str(SAMPLE_RATE), "-g", "1.5", "-ni", sf2, mid],
+                [exe, "-ni", "-q", "-g", "1.5", "-F", tmp, "-r", str(SAMPLE_RATE), sf2, mid],
             ]
             for cmd in cmds:
                 try:
@@ -1224,7 +1381,20 @@ class AudioEngine:
             self._backend.on_end = cb
 
     def set_device_name(self, name: str):
-        self.device_name = name or ""
+        name = name or ""
+        if name == self.device_name:
+            return
+        self.device_name = name
+        self._discard_backend()
+
+    def _discard_backend(self):
+        if self._backend is not None:
+            try:
+                self._backend.free()
+            except Exception:
+                pass
+            self._backend = None
+            self._backend_name = ""
 
     def _make(self, kind: str) -> AudioBackend:
         kwargs = dict(device_name=self.device_name, on_end=self.on_end)
@@ -1253,7 +1423,6 @@ class AudioEngine:
         return "ffmpeg"
 
     def play(self, filepath: str, start_ms: int = 0) -> bool:
-        self.stop()
         kind = self.pick_kind(filepath)
         order = [kind]
         # do NOT blindly fall back to miniaudio for tracker/midi — it cannot decode them
@@ -1265,6 +1434,19 @@ class AudioEngine:
             order.append("miniaudio")
         elif kind == "miniaudio":
             order.append("ffmpeg")
+        # Same backend: reuse the already-open playback device.
+        if self._backend is not None and self._backend_name == order[0]:
+            try:
+                self._backend.set_volume(self._volume)
+                if self._backend.play(filepath, start_ms=start_ms):
+                    self.last_error = ""
+                    log(f"[engine] {order[0]} playing {filepath}", 20)
+                    return True
+            except Exception as e:
+                log(f"[engine] reuse {order[0]} failed: {e}", 30)
+            self._discard_backend()
+        else:
+            self._discard_backend()
         errors = []
         for k in order:
             backend = self._make(k)
@@ -1291,11 +1473,6 @@ class AudioEngine:
                 self._backend.stop()
             except Exception:
                 pass
-            try:
-                self._backend.free()
-            except Exception:
-                pass
-            self._backend = None
 
     def pause(self):
         if self._backend:
@@ -1347,4 +1524,4 @@ class AudioEngine:
         return self._backend_name
 
     def free(self):
-        self.stop()
+        self._discard_backend()
