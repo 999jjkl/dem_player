@@ -22,43 +22,44 @@ if not exist "%OUT%\dem_player.exe" (
 )
 
 echo [build] copying sidecar tools next to the exe
-call :copy_if ffmpeg.exe
-call :copy_if ffprobe.exe
-call :copy_if openmpt123.exe
-call :copy_if libopenmpt.dll
-call :copy_if openmpt-mpg123.dll
-call :copy_if fluidsynth.exe
-call :copy_if libfluidsynth-3.dll
-call :copy_if SDL3.dll
-call :copy_if sndfile.dll
-call :copy_if furnace.exe
-call :copy_if asapconv.exe
-call :copy_if zxtune123.exe
-call :copy_if zxtune-cli.exe
-call :copy_if font.ttf
-call :copy_if FPT.ico
-call :copy_if Background.png
-call :copy_if background.png
-call :copy_if soundfont.sf2
-call :copy_if FluidR3_GM.sf2
-call :copy_if weedsgm3.sf2
+for %%F in (
+    ffmpeg.exe
+    ffprobe.exe
+    openmpt123.exe
+    libopenmpt.dll
+    openmpt-mpg123.dll
+    fluidsynth.exe
+    libfluidsynth-3.dll
+    SDL3.dll
+    sndfile.dll
+    furnace.exe
+    asapconv.exe
+    zxtune123.exe
+    zxtune-cli.exe
+    font.ttf
+    FPT.ico
+    Background.png
+    background.png
+    soundfont.sf2
+    FluidR3_GM.sf2
+    weedsgm3.sf2
+) do (
+    if exist "%%~F" (
+        copy /Y "%%~F" "%OUT%\%%~F" >nul
+        echo   + %%~F
+    ) else (
+        echo   - %%~F skipped
+    )
+)
 
 echo.
 echo [build] DONE
 echo        Run:  %CD%\%OUT%\dem_player.exe
 echo        Copy the whole folder  dist\dem_player  to share it.
 echo        Optional: copy your  data\  folder next to the exe to keep playlists.
+echo        If furnace.exe was missing last time, copy it into that folder now.
 echo.
 pause
-exit /b 0
-
-:copy_if
-if exist "%~1" (
-    copy /Y "%~1" "%OUT%\%~1" >nul
-    echo   + %~1
-) else (
-    echo   - %~1  (not in this folder, skipped)
-)
 exit /b 0
 
 :fail
