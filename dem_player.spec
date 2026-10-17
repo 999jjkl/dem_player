@@ -1,8 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller spec for dem_player (Windows onedir, no console).
 
-Huge tools (ffmpeg, soundfonts, openmpt123, fluidsynth, furnace, zxtune)
-are NOT baked into the archive — build.bat copies them next to the exe.
+Do NOT collect_all('PySide6') — that pulls QtWebEngine/3D and balloons the build.
+Huge tools (ffmpeg, soundfonts, ...) are copied next to the exe by build.bat.
 """
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ if not os.path.isfile(ICON):
     ICON = None
 
 datas, binaries, hidden = [], [], []
-for pkg in ("PySide6", "miniaudio", "sounddevice", "mutagen", "numpy"):
+for pkg in ("numpy", "mutagen"):
     try:
         d, b, h = collect_all(pkg)
         datas += d
@@ -25,6 +25,20 @@ for pkg in ("PySide6", "miniaudio", "sounddevice", "mutagen", "numpy"):
         hidden += h
     except Exception:
         hidden.append(pkg)
+
+hidden += [
+    "miniaudio",
+    "sounddevice",
+    "cffi",
+    "_cffi_backend",
+    "PySide6.QtCore",
+    "PySide6.QtGui",
+    "PySide6.QtWidgets",
+    "core",
+    "storage",
+    "audio",
+    "converters",
+]
 
 for name in ("font.ttf", "FPT.ico", "Background.png", "background.png"):
     p = os.path.join(SPECDIR, name)
@@ -36,23 +50,26 @@ a = Analysis(
     pathex=[SPECDIR],
     binaries=binaries,
     datas=datas,
-    hiddenimports=hidden + [
-        "PySide6.QtCore",
-        "PySide6.QtGui",
-        "PySide6.QtWidgets",
-        "miniaudio",
-        "sounddevice",
-        "mutagen",
-        "numpy",
-        "core",
-        "storage",
-        "audio",
-        "converters",
-    ],
+    hiddenimports=hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=["tkinter", "matplotlib", "PyQt5", "PyQt6", "IPython", "pytest", "unittest"],
+    excludes=[
+        "tkinter", "matplotlib", "PyQt5", "PyQt6", "IPython", "pytest", "unittest",
+        "numpy.tests", "numpy.f2py.tests",
+        "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtWebEngineQuick",
+        "PySide6.Qt3DCore", "PySide6.Qt3DRender", "PySide6.Qt3DExtras",
+        "PySide6.QtQuick", "PySide6.QtQml", "PySide6.QtCharts",
+        "PySide6.QtDataVisualization", "PySide6.QtGraphs",
+        "PySide6.QtBluetooth", "PySide6.QtNfc", "PySide6.QtSerialPort",
+        "PySide6.QtLocation", "PySide6.QtPositioning",
+        "PySide6.QtPdf", "PySide6.QtPdfWidgets",
+        "PySide6.QtRemoteObjects", "PySide6.QtScxml",
+        "PySide6.QtSensors", "PySide6.QtSerialBus",
+        "PySide6.QtTextToSpeech", "PySide6.QtWebSockets",
+        "PySide6.QtWebView", "PySide6.QtHttpServer",
+        "PySide6.scripts",
+    ],
     noarchive=False,
 )
 
