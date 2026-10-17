@@ -4,6 +4,7 @@ import os
 import shutil
 import re
 import traceback
+import random
 from collections import OrderedDict
 
 from PySide6.QtWidgets import (
@@ -13,7 +14,8 @@ from PySide6.QtWidgets import (
     QSystemTrayIcon, QMenu, QStyle, QFileDialog, QDialog, QTextEdit,
     QDialogButtonBox
 )
-from PySide6.QtCore import Qt, QTimer, QEvent, Slot, QPoint
+from PySide6.QtCore import Qt, QTimer, QEvent, Slot, QPoint, QObject
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtGui import (
     QFont, QKeyEvent, QFontDatabase, QPainter, QColor, QPen, QFontMetrics,
     QPixmap, QIcon, QAction, QGuiApplication, QTextCursor, QTextCharFormat,
@@ -25,7 +27,8 @@ from core import (
     app_dir, data_path, resource_path, logs_dir,
     init_log, log, close_log,
     parse_cue_file, parse_m3u, read_metadata as core_read_metadata,
-    prevent_sleep, apply_cpu_affinity, HAS_MUTAGEN,
+    prevent_sleep, apply_cpu_affinity, apply_window_blur, HAS_MUTAGEN,
+    probe_file_duration_ms, same_path, register_open_with,
 )
 import core as core_mod
 from storage import (
@@ -42,19 +45,43 @@ from audio import (
 )
 from converters import ConversionThread, FurnaceConverter, AsapConverter, ZxtuneConverter
 
-try:
-    import numpy as np
-    HAS_NUMPY = True
-except ImportError:
-    HAS_NUMPY = False
+# numpy / sounddevice are heavy. Import them the first time audio-level needs them.
+_np = None
+_sd = None
+HAS_NUMPY = None
+HAS_SOUNDDEVICE = None
 
-try:
-    import sounddevice as sd
-    HAS_SOUNDDEVICE = True
-except ImportError:
-    HAS_SOUNDDEVICE = False
+
+def _ensure_numpy():
+    global _np, HAS_NUMPY
+    if HAS_NUMPY is not None:
+        return _np
+    try:
+        import numpy as np
+        _np = np
+        HAS_NUMPY = True
+    except ImportError:
+        _np = None
+        HAS_NUMPY = False
+    return _np
+
+
+def _ensure_sd():
+    global _sd, HAS_SOUNDDEVICE
+    if HAS_SOUNDDEVICE is not None:
+        return _sd
+    try:
+        import sounddevice as sd
+        _sd = sd
+        HAS_SOUNDDEVICE = True
+    except ImportError:
+        _sd = None
+        HAS_SOUNDDEVICE = False
+    return _sd
 
 QWIDGETSIZE_MAX = 16777215
+UI_FONT_PT = 10
+IPC_NAME = "dem_player_single"
 
 # ---------- custom font ----------
 def load_custom_font():
@@ -221,7 +248,7 @@ class TextEQWidget(QFrame):
         self.names = ["Bass:", "Mid:", "Treble:", "Volume:"]
         for name in self.names:
             lbl = QLabel()
-            lbl.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+            lbl.setFont(QFont("Courier New", UI_FONT_PT, QFont.Weight.Bold))
             lbl.setStyleSheet(f"color: {self.accent_color.name()}; background: transparent;")
             layout.addWidget(lbl)
             self.labels.append(lbl)
@@ -510,6 +537,13 @@ class MusicRoom(QMainWindow):
     ]
 
     LEVEL_SUPPORTED_EXT = ('.mp3', '.flac', '.wav', '.ogg', '.m4a', '.aac', '.wma', '.opus', '.alac')
+    AUDIO_EXTS = (
+        '.mp3', '.wav', '.ogg', '.m4a', '.flac',
+        '.dnm', '.ftm', '.it', '.mid', '.midi', '.mod',
+        '.mptm', '.mpt', '.mt2', '.rmi', '.s3m', '.sap', '.sid',
+        '.tm8', '.xm', '.vgm', '.vgz',
+        '.opus', '.alac', '.aac', '.wma', '.ac3',
+    )
 
     def __init__(self):
         super().__init__()
@@ -533,10 +567,10 @@ class MusicRoom(QMainWindow):
 
         custom_font_family = load_custom_font()
         if custom_font_family:
-            self.dos_font = QFont(custom_font_family, 10)
+            self.dos_font = QFont(custom_font_family, UI_FONT_PT)
             self.dos_font.setBold(True)
         else:
-            self.dos_font = QFont("Courier New", 10)
+            self.dos_font = QFont("Courier New", UI_FONT_PT)
             self.dos_font.setBold(True)
 
         settings = migrate_old_files_if_needed()
@@ -557,11 +591,18 @@ class MusicRoom(QMainWindow):
         self.show_audio_level = settings.get("show_audio_level", False)
         self.audio_level_source = settings.get("audio_level_source", "file")
         self.loop_mode = settings.get("loop_mode", 0)
+        if self.loop_mode not in (0, 1, 2, 3):
+            self.loop_mode = 0
         self.initial_volume = settings.get("volume", 50)
         self.window_mode = settings.get("window_mode", 0)
         self.background_mode = settings.get("background_mode", "transparent")
+        try:
+            self.aero_opacity = max(0, min(100, int(settings.get("aero_opacity", 40))))
+        except (TypeError, ValueError):
+            self.aero_opacity = 40
         self.custom_background_path = settings.get("custom_background_path", "") or ""
         self.is_always_on_top = settings.get("always_on_top", False)
+        self.allow_screensaver = bool(settings.get("allow_screensaver", False))
         self.time_format = settings.get("time_format", TIME_FORMAT_MM_SS_CC)
         if self.time_format not in (TIME_FORMAT_MM_SS, TIME_FORMAT_MM_SS_CC):
             self.time_format = TIME_FORMAT_MM_SS_CC
@@ -592,10 +633,14 @@ class MusicRoom(QMainWindow):
         self.furnace_available = FurnaceConverter.available()
         self.asap_available = AsapConverter.available()
         self.zxtune_available = ZxtuneConverter.available()
-        self.libopenmpt_available = bool(probe_openmpt())
-        self.fluidsynth_available = bool(probe_fluidsynth())
-        self.soundfont_available = bool(probe_soundfont())
-        self.ffmpeg_available = bool(probe_ffmpeg())
+        # File exists only — do not CDLL / import fluidsynth before the window is up.
+        self.ffmpeg_available = os.path.isfile(resource_path("ffmpeg.exe"))
+        self.libopenmpt_available = os.path.isfile(resource_path("openmpt123.exe")) or os.path.isfile(resource_path("libopenmpt.dll"))
+        self.fluidsynth_available = os.path.isfile(resource_path("fluidsynth.exe")) or os.path.isfile(resource_path("libfluidsynth-3.dll"))
+        self.soundfont_available = any(
+            os.path.isfile(resource_path(n))
+            for n in ("soundfont.sf2", "FluidR3_GM.sf2", "weedsgm3.sf2")
+        )
 
         def _qt_on_end():
             QTimer.singleShot(0, self.on_media_end)
@@ -628,8 +673,13 @@ class MusicRoom(QMainWindow):
 
         self.convert_cache = OrderedDict()
         self.cache_max_size = 10
+        self._dur_verified_path = None
+        self._dur_verified_ms = 0
+        self._scan_queue = []
+        self._scan_total = 0
+        self._scan_done = 0
 
-        self.loop_mode_names = ["OFF", "SINGLE", "LIST"]
+        self.loop_mode_names = ["OFF", "SINGLE", "LIST", "RANDOM"]
 
         self.show_settings = False
         self.left_visible = True
@@ -757,7 +807,7 @@ class MusicRoom(QMainWindow):
             self.stop_current_engine()
         except Exception:
             pass
-        prevent_sleep(False)
+        self._set_keep_awake(False)
         self.output_device = device_id or ""
         self.audio_engine.set_device_name(self.output_device)
         self._save_settings()
@@ -795,8 +845,13 @@ class MusicRoom(QMainWindow):
             "volume": self.volume_text.value() if hasattr(self, "volume_text") else self.initial_volume,
             "window_mode": self.window_mode,
             "background_mode": self.background_mode,
-            "custom_background_path": getattr(self, "custom_background_path", ""),
+            "aero_opacity": getattr(self, "aero_opacity", 40),
+            # store filename only so moving the player folder does not break the bg
+            "custom_background_path": (
+                CUSTOM_BACKGROUND_FILENAME if self._resolved_custom_bg() else ""
+            ),
             "always_on_top": self.is_always_on_top,
+            "allow_screensaver": bool(getattr(self, "allow_screensaver", False)),
             "time_format": self.time_format,
             "output_device": getattr(self, "output_device", ""),
             "engine_mode": "auto",
@@ -890,6 +945,7 @@ class MusicRoom(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         central.setObjectName("MainPlayerFrame")
+        self.setAcceptDrops(True)
 
         main_layout = QHBoxLayout(central)
         main_layout.setContentsMargins(8, 8, 8, 8)
@@ -951,7 +1007,7 @@ class MusicRoom(QMainWindow):
         self.close_btn = QPushButton("X")
         for btn in (self.min_btn, self.close_btn):
             btn.setFixedSize(24, 24)
-            btn.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+            btn.setFont(QFont("Courier New", UI_FONT_PT, QFont.Weight.Bold))
             btn.setStyleSheet(f"color: {self.accent_color}; background: transparent; border: 1px solid {self.accent_color};")
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.min_btn.clicked.connect(self.minimize_to_tray)
@@ -1015,8 +1071,8 @@ class MusicRoom(QMainWindow):
             "Keys:\n"
             "[↑/↓] Nav  [ENTER] Open  [BS] Back\n"
             "[F1] Pause  [F2/F3] Vol  [F4] Hide\n"
-            "[F5] Loop   [F6] Mode    [F7] Settings\n"
-            "[F8] Search [F9] Favs  [Esc] Reset  [←/→] -/+1s"
+            "[F5] Loop  [F6] Mode  [F7] Settings\n"
+            "[F8] Search [F9] Favs  [F10] This folder dur  [Esc] Reset"
         )
         self.keys_label.setFont(self.dos_font)
         self.keys_label.setWordWrap(False)
@@ -1083,8 +1139,9 @@ class MusicRoom(QMainWindow):
         self._bg_scaled_for = None
 
         if self.background_mode == "image":
-            custom_path = getattr(self, "custom_background_path", "") or ""
-            if custom_path and os.path.isfile(custom_path):
+            # portable copy in data/backgrounds first; then legacy absolute path
+            custom_path = self._resolved_custom_bg()
+            if custom_path:
                 pm = QPixmap(custom_path)
                 if not pm.isNull():
                     self.bg_pixmap = pm
@@ -1098,17 +1155,50 @@ class MusicRoom(QMainWindow):
                 self.background_mode = "solid"
 
         if self.background_mode == "transparent":
+            # 0.20: Qt alpha only. Half-black sheet, desktop shows through, no DWM blur.
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-            self.centralWidget().setStyleSheet("background-color: rgba(0, 0, 0, 0.5);")
+            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
+            if self.centralWidget() is not None:
+                self.centralWidget().setStyleSheet("background-color: rgba(0, 0, 0, 0.5);")
+        elif self.background_mode == "aero":
+            self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+            if self.centralWidget() is not None:
+                a = self._aero_overlay_alpha()
+                self.centralWidget().setStyleSheet(f"background-color: rgba(8, 8, 12, {a});")
         else:
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-            if self.background_mode == "solid":
-                self.centralWidget().setStyleSheet("background-color: #000000;")
-            else:
-                self.centralWidget().setStyleSheet("background-color: transparent;")
+            self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
+            if self.centralWidget() is not None:
+                if self.background_mode == "solid":
+                    self.centralWidget().setStyleSheet("background-color: #000000;")
+                else:
+                    self.centralWidget().setStyleSheet("background-color: transparent;")
         if hasattr(self, 'right_frame'):
             self.right_frame.setStyleSheet("background-color: transparent;")
         self.update()
+        QTimer.singleShot(0, self._apply_aero_blur)
+
+    def _apply_aero_blur(self):
+        mode = self.background_mode
+        try:
+            if mode == "aero":
+                apply_window_blur(self.winId(), True, opacity=getattr(self, "aero_opacity", 40), kind="aero")
+            elif mode == "transparent":
+                apply_window_blur(self.winId(), False, kind="qt")
+                self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+                if self.centralWidget() is not None:
+                    self.centralWidget().setStyleSheet("background-color: rgba(0, 0, 0, 0.5);")
+            else:
+                apply_window_blur(self.winId(), False, kind="off")
+        except Exception as e:
+            log(f"[Aero] {e}", 30)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Win11 reapplies acrylic after show. Push the real mode again.
+        QTimer.singleShot(0, self._apply_aero_blur)
+        QTimer.singleShot(250, self._apply_aero_blur)
 
     # ================== SETTINGS UI ==================
 
@@ -1116,6 +1206,8 @@ class MusicRoom(QMainWindow):
         self.settings_list.clear()
         top_state = "Y" if self.is_always_on_top else "N"
         self.settings_list.addItem(f"Always on Top                        [{top_state}]")
+        saver = "Y" if getattr(self, "allow_screensaver", False) else "N"
+        self.settings_list.addItem(f"Allow Screensaver While Playing      [{saver}]")
         style_name = self.THEMES[self.current_theme_index][0]
         self.settings_list.addItem(f"Style                                [{style_name}]")
         level_state = "Y" if self.show_audio_level else "N"
@@ -1129,11 +1221,10 @@ class MusicRoom(QMainWindow):
         self.settings_list.addItem("Background Image...")
         self.settings_list.addItem("Clear Background Image")
         _bg_state = self.background_mode
-        if (self.background_mode == "image"
-                and getattr(self, "custom_background_path", "")
-                and os.path.isfile(self.custom_background_path)):
+        if (self.background_mode in ("image",) and self._resolved_custom_bg()):
             _bg_state = "image (custom)"
         self.settings_list.addItem(f"Background                           [{_bg_state}]")
+        self.settings_list.addItem(f"Aero Opacity                         [{getattr(self, 'aero_opacity', 40)}%]")
         log_state = "Y" if core_mod.LOG_ENABLED else "N"
         self.settings_list.addItem(f"Log Save                             [{log_state}]")
         dur_state = "Y" if self.show_duration else "N"
@@ -1147,6 +1238,8 @@ class MusicRoom(QMainWindow):
             self.settings_list.addItem(f"Remove Folder                        [{i}] {p}")
         self.settings_list.addItem("Add Music Folder...")
         self.settings_list.addItem("Refresh File List")
+        self.settings_list.addItem("Register Open With...")
+        self.settings_list.addItem("Scan This Folder Durations (F10)")
         self.settings_list.addItem("--- Maintenance ---")
         self.settings_list.addItem("Clear History")
         self.settings_list.addItem("Clear Play Counts")
@@ -1159,6 +1252,13 @@ class MusicRoom(QMainWindow):
         text = item.text()
         if text.startswith("Always on Top"):
             self.toggle_always_on_top()
+        elif text.startswith("Allow Screensaver"):
+            self.allow_screensaver = not self.allow_screensaver
+            self._set_keep_awake(self.audio_engine.is_playing())
+            self._save_settings()
+            self.track_status.setText(
+                "Screensaver allowed while playing" if self.allow_screensaver
+                else "Screensaver blocked while playing")
         elif text.startswith("Style"):
             self.cycle_theme()
         elif text.startswith("Audio Level Source"):
@@ -1177,6 +1277,8 @@ class MusicRoom(QMainWindow):
             self.clear_background_image()
         elif text.startswith("Background"):
             self.cycle_background_mode()
+        elif text.startswith("Aero Opacity"):
+            self.cycle_aero_opacity()
         elif text.startswith("Log Save"):
             self.toggle_log_enabled()
         elif text.startswith("Show Duration"):
@@ -1222,6 +1324,10 @@ class MusicRoom(QMainWindow):
                     self.track_status.setText("Folder already in list")
         elif text.startswith("Refresh File List"):
             self.refresh_current_directory()
+        elif text.startswith("Register Open With"):
+            self.register_open_with_dialog()
+        elif text.startswith("Scan This Folder Durations"):
+            self.start_duration_scan()
         elif text.startswith("Clear History"):
             reply = QMessageBox.question(self, "Confirm", "Clear all play history?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -1275,15 +1381,11 @@ class MusicRoom(QMainWindow):
                 self.show_audio_level = False
                 self.audio_level_source = "file"
                 self.loop_mode = 0
-                self.background_mode = "transparent"
-                self.custom_background_path = ""
-                try:
-                    _p = os.path.join(BACKGROUND_DIR, CUSTOM_BACKGROUND_FILENAME)
-                    if os.path.exists(_p):
-                        os.remove(_p)
-                except Exception as e:
-                    log(f"[BG] reset remove failed: {e}", 30)
+                self.background_mode = "aero"
+                self.aero_opacity = 40
+                self._remove_custom_bg_file()  # same as Clear Background Image
                 self.is_always_on_top = False
+                self.allow_screensaver = False
                 self.time_format = TIME_FORMAT_MM_SS_CC
                 self.output_device = ""
                 self.engine_mode = "auto"
@@ -1297,6 +1399,28 @@ class MusicRoom(QMainWindow):
         elif text.startswith("About dem_player"):
             self.show_about_dialog()
         self.update_settings_list()
+
+    def register_open_with_dialog(self):
+        if sys.platform != "win32":
+            QMessageBox.information(self, "Open With", "Windows only.")
+            return
+        try:
+            n, cmd = register_open_with()
+        except Exception as e:
+            log(f"[OpenWith] register failed: {e}", 40)
+            QMessageBox.warning(self, "Open With", f"Register failed:\n{e}")
+            return
+        self.track_status.setText("Registered for Open with")
+        QMessageBox.information(
+            self,
+            "以這個程式開啟",
+            "已登錄 dem_player。\n\n"
+            "在歌曲上按右鍵 → 開啟檔案方式 → 選擇其他應用程式 → dem_player\n"
+            "（Windows 11：顯示更多選項 → 開啟檔案方式）\n\n"
+            "這不會搶走預設播放器。\n"
+            "若播放器已經開著，檔案會送到這一個視窗。\n\n"
+            f"{cmd}",
+        )
 
     def toggle_time_format(self):
         if self.time_format == TIME_FORMAT_MM_SS_CC:
@@ -1327,7 +1451,7 @@ class MusicRoom(QMainWindow):
                 log_path = getattr(core_mod.LOG_FILE, "name", "") or ""
         except Exception:
             log_path = ""
-        custom_ok = bool(getattr(self, "custom_background_path", "")) and os.path.isfile(self.custom_background_path)
+        custom_ok = bool(self._resolved_custom_bg())
         backend = self.audio_engine.current_name or getattr(self, "current_engine", "") or "-"
         paused = False
         playing = False
@@ -1350,8 +1474,8 @@ class MusicRoom(QMainWindow):
         lines.append(f"Python      : {sys.version.splitlines()[0]}")
         lines.append(f"Platform    : {sys.platform}")
         lines.append(f"Frozen      : {getattr(sys, 'frozen', False)}")
-        lines.append(f"numpy       : {HAS_NUMPY}")
-        lines.append(f"sounddevice : {HAS_SOUNDDEVICE}")
+        lines.append(f"numpy       : {_ensure_numpy() is not None}")
+        lines.append(f"sounddevice : {_ensure_sd() is not None}")
         lines.append(f"mutagen     : {HAS_MUTAGEN}" + ("" if HAS_MUTAGEN else "  (metadata disabled)"))
         lines.append(f"miniaudio   : {HAS_MINIAUDIO}")
         lines.append(f"executable  : {sys.executable}")
@@ -1400,10 +1524,12 @@ class MusicRoom(QMainWindow):
         lines.append(f"time format    : {self.time_format}")
         lines.append(f"window mode    : {window_names.get(self.window_mode, self.window_mode)}")
         lines.append(f"background     : {self.background_mode}")
+        lines.append(f"aero opacity   : {getattr(self, 'aero_opacity', 40)}%")
         lines.append(f"custom bg      : {yesno(custom_ok)}")
         if custom_ok:
             lines.append(f"custom bg path : {self.custom_background_path}")
         lines.append(f"always on top  : {self.is_always_on_top}")
+        lines.append(f"screensaver ok : {getattr(self, 'allow_screensaver', False)}")
         lines.append(f"show duration  : {self.show_duration}")
         lines.append(f"show cover art : {self.show_cover_art}")
         lines.append(f"show play cnt  : {self.show_play_counts}")
@@ -1419,19 +1545,50 @@ class MusicRoom(QMainWindow):
         return "\n".join(lines)
 
     def cycle_background_mode(self):
-        has_img = (
-            (getattr(self, "custom_background_path", "")
-             and os.path.isfile(self.custom_background_path))
-            or os.path.isfile(resource_path("background.png"))
-        )
-        if self.background_mode == "transparent":
-            self.background_mode = "solid"
-        elif self.background_mode == "solid":
-            self.background_mode = "image" if has_img else "transparent"
-        else:
-            self.background_mode = "transparent"
-        self.apply_background_image()
+        has_img = bool(self._resolved_custom_bg() or os.path.isfile(resource_path("background.png")))
+        order = ["transparent", "aero", "solid", "image"] if has_img else ["transparent", "aero", "solid"]
+        cur = self.background_mode if self.background_mode in order else "aero"
+        self.background_mode = order[(order.index(cur) + 1) % len(order)]
+        self.apply_theme()
         self._save_settings()
+        self.track_status.setText(f"Background: {self.background_mode}")
+
+    def _aero_overlay_alpha(self):
+        op = max(0, min(100, int(getattr(self, "aero_opacity", 40))))
+        return max(16, min(220, int(round(16 + op * 2.04))))
+
+    def cycle_aero_opacity(self):
+        cur = int(getattr(self, "aero_opacity", 40))
+        nxt = cur + 10
+        if nxt > 100:
+            nxt = 0
+        self.aero_opacity = nxt
+        self.apply_theme()
+        self._save_settings()
+        self.track_status.setText(f"Aero opacity {self.aero_opacity}%")
+
+    def _portable_custom_bg_path(self):
+        return os.path.join(BACKGROUND_DIR, CUSTOM_BACKGROUND_FILENAME)
+
+    def _resolved_custom_bg(self):
+        """Always prefer data/backgrounds/custom_background.png (survives move/rename)."""
+        portable = self._portable_custom_bg_path()
+        if os.path.isfile(portable):
+            return portable
+        stored = getattr(self, "custom_background_path", "") or ""
+        if stored and stored != CUSTOM_BACKGROUND_FILENAME and os.path.isfile(stored):
+            return stored
+        return ""
+
+    def _remove_custom_bg_file(self):
+        """Clear + Reset both call this: delete portable file, forget settings path."""
+        _p = self._portable_custom_bg_path()
+        try:
+            if os.path.isfile(_p):
+                os.remove(_p)
+        except Exception as e:
+            log(f"[BG] remove failed: {e}", 30)
+        self.custom_background_path = ""
 
     def pick_background_image(self):
         src, _ = QFileDialog.getOpenFileName(
@@ -1523,7 +1680,8 @@ class MusicRoom(QMainWindow):
             QMessageBox.warning(self, "Cannot Use This Image", f"Replace failed: {e}")
             return
 
-        self.custom_background_path = dst
+        # save the filename only (not an absolute path) so settings stay portable
+        self.custom_background_path = CUSTOM_BACKGROUND_FILENAME
         if self.background_mode != "image":
             self.background_mode = "image"
         self.apply_background_image()
@@ -1536,8 +1694,7 @@ class MusicRoom(QMainWindow):
             f"({final_size} bytes, resized={need_resize})", 20)
 
     def clear_background_image(self):
-        _p = os.path.join(BACKGROUND_DIR, CUSTOM_BACKGROUND_FILENAME)
-        if not getattr(self, "custom_background_path", "") and not os.path.isfile(_p):
+        if not self._resolved_custom_bg():
             QMessageBox.information(self, "Info", "No custom background image is set")
             return
         reply = QMessageBox.question(
@@ -1547,13 +1704,7 @@ class MusicRoom(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
 
-        try:
-            if os.path.exists(_p):
-                os.remove(_p)
-        except Exception as e:
-            log(f"[BG] remove failed: {e}", 30)
-
-        self.custom_background_path = ""
+        self._remove_custom_bg_file()
         self.apply_background_image()
         self.update()
         self._save_settings()
@@ -1577,7 +1728,7 @@ class MusicRoom(QMainWindow):
 
     def toggle_audio_level_source(self):
         if self.audio_level_source == "file":
-            if not HAS_SOUNDDEVICE:
+            if _ensure_sd() is None:
                 self.track_status.setText("sounddevice not installed")
                 return
             self.audio_level_source = "system"
@@ -1587,7 +1738,8 @@ class MusicRoom(QMainWindow):
             self.stop_system_audio_capture()
         self._save_settings()
     def start_system_audio_capture(self):
-        if not HAS_SOUNDDEVICE:
+        sd = _ensure_sd()
+        if sd is None:
             return
         try:
             devices = sd.query_devices()
@@ -1625,7 +1777,8 @@ class MusicRoom(QMainWindow):
         self._system_audio_data = indata.copy()
 
     def _calculate_system_spectrum(self):
-        if not HAS_NUMPY or self._system_audio_data is None:
+        np = _ensure_numpy()
+        if np is None or self._system_audio_data is None:
             return (0.0, 0.0, 0.0, 0.0)
         try:
             data = self._system_audio_data
@@ -1680,6 +1833,13 @@ class MusicRoom(QMainWindow):
         if self.show_settings:
             self.update_settings_list()
 
+    def _set_keep_awake(self, playing: bool):
+        # N = block screensaver while a track is playing (old behavior).
+        if playing and not getattr(self, "allow_screensaver", False):
+            prevent_sleep(True)
+        else:
+            prevent_sleep(False)
+
     def toggle_always_on_top(self):
         self.is_always_on_top = not self.is_always_on_top
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, self.is_always_on_top)
@@ -1696,16 +1856,29 @@ class MusicRoom(QMainWindow):
         bg = self.bg_color
         c = self.accent_color
         font_family = self.dos_font.family()
+        if self.background_mode == "aero":
+            win_bg = "transparent"
+            list_bg = f"rgba(0, 0, 0, {max(20, self._aero_overlay_alpha() - 16)})"
+        elif self.background_mode == "image":
+            win_bg = "transparent"
+            list_bg = "transparent"
+        else:
+            # solid and transparent match 0.20: theme color, frames clear.
+            # transparent then paints the central widget at rgba(0,0,0,0.5).
+            win_bg = bg
+            list_bg = "transparent"
+        pt = UI_FONT_PT
         style = f"""
-            QMainWindow {{ background-color: {bg}; }}
-            QWidget {{ background-color: {bg}; color: {c}; font-family: '{font_family}', monospace; font-size: 10pt; font-weight: bold; }}
-            QFrame {{ border: 2px solid {c}; padding: 4px; background-color: transparent; }}
-            QListWidget {{ border: 2px solid {c}; background-color: transparent; color: {c}; outline: none; }}
+            QMainWindow {{ background-color: {win_bg}; }}
+            QWidget {{ background-color: {win_bg}; color: {c}; font-family: '{font_family}', monospace; font-size: {pt}pt; font-weight: bold; }}
+            QFrame {{ border: 2px solid {c}; padding: 4px; background-color: {list_bg}; }}
+            QListWidget {{ border: 2px solid {c}; background-color: {list_bg}; color: {c}; outline: none; font-size: {pt}pt; }}
             QListWidget::item:selected {{ background-color: {c}; color: {bg}; }}
             QSlider::groove:horizontal {{ border: 1px solid {c}; height: 6px; background: transparent; }}
             QSlider::handle:horizontal {{ background: {c}; border: 1px solid {c}; width: 10px; margin: -4px 0; }}
-            QLineEdit {{ background-color: transparent; color: {c}; border: 1px solid {c}; padding: 2px; font-family: '{font_family}', monospace; font-size: 10pt; font-weight: bold; }}
-            QLabel {{ background-color: transparent; }}
+            QLineEdit {{ background-color: {list_bg}; color: {c}; border: 1px solid {c}; padding: 2px; font-family: '{font_family}', monospace; font-size: {pt}pt; font-weight: bold; }}
+            QLabel {{ background-color: transparent; font-size: {pt}pt; }}
+            QPushButton {{ font-size: {pt}pt; }}
         """
         self.setStyleSheet(style)
         if hasattr(self, 'text_eq'):
@@ -1722,6 +1895,31 @@ class MusicRoom(QMainWindow):
             self.drag_frame.set_accent_color(c)
 
     # ================== TRACK MODEL ==================
+    # UI-only: hide emoji in song titles. Real filenames / cache keys stay unchanged.
+    _EMOJI_RE = re.compile(
+        "["
+        "\U0001F1E6-\U0001F1FF"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F600-\U0001F64F"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F700-\U0001FAFF"
+        "\U00002600-\U000026FF"
+        "\U00002700-\U000027BF"
+        "\U00002300-\U000023FF"
+        "\U00002B50\U00002B55"
+        "\U0000FE0F\U0000200D\U000020E3"
+        "]+"
+    )
+
+    @staticmethod
+    def _mask_emoji_for_ui(text):
+        if not text:
+            return text
+        out = MusicRoom._EMOJI_RE.sub("☒", text)
+        while "☒☒" in out:
+            out = out.replace("☒☒", "☒")
+        return out
+
     @staticmethod
     def get_display_name(path):
         if path.startswith("http://") or path.startswith("https://"):
@@ -1755,10 +1953,11 @@ class MusicRoom(QMainWindow):
             base = f"{title}"
             if performer:
                 base = f"{performer} - {title}"
-            return base
-        if path.startswith("http"):
-            return self.get_display_name(path)
-        return self.get_display_name(path).lower()
+            return self._mask_emoji_for_ui(base)
+        name = self.get_display_name(path)
+        if not path.startswith("http"):
+            name = name.lower()
+        return self._mask_emoji_for_ui(name)
 
     def read_metadata(self, track):
         return core_read_metadata(track)
@@ -1789,7 +1988,7 @@ class MusicRoom(QMainWindow):
             if self.window_mode != 2:
                 self.toggle_left_visibility()
         elif key == Qt.Key.Key_F5:
-            self.loop_mode = (self.loop_mode + 1) % 3
+            self.loop_mode = (self.loop_mode + 1) % 4
             self.loop_label.setText(f"Loop: {self.loop_mode_names[self.loop_mode]}")
             self._save_settings()
         elif key == Qt.Key.Key_F6:
@@ -1813,6 +2012,8 @@ class MusicRoom(QMainWindow):
                 self.search_input.clearFocus()
                 self.file_list.setFocus()
             self.handle_f9()
+        elif key == Qt.Key.Key_F10:
+            self.start_duration_scan()
         elif key == Qt.Key.Key_Escape:
             self.reset_player()
         elif key == Qt.Key.Key_Left:
@@ -1907,7 +2108,7 @@ class MusicRoom(QMainWindow):
 
     def reset_player(self):
         self.stop_current_engine()
-        prevent_sleep(False)
+        self._set_keep_awake(False)
         self.current_file_path = None
         self.current_track_info = None
         self.spectrum_source_path = None
@@ -2077,8 +2278,8 @@ class MusicRoom(QMainWindow):
             self.right_stretch_item.setSpacing(0)
         self.setFocus()
 
-    def setFontSize(self, size):
-        self.dos_font.setPointSize(size)
+    def setFontSize(self, size=None):
+        self.dos_font.setPointSize(UI_FONT_PT)
 
     def apply_font_to_all(self):
         for widget in self.findChildren(QLabel):
@@ -2140,7 +2341,7 @@ class MusicRoom(QMainWindow):
         self._cue_end_ms = None
         if self.conv_thread and self.conv_thread.isRunning():
             self.conv_thread.requestInterruption()
-            self.conv_thread.wait(1000)
+            self.conv_thread.wait(80)
             self.conv_thread = None
         self.audio_engine.stop()
     def _add_to_cache(self, original_key, wav_path):
@@ -2163,6 +2364,70 @@ class MusicRoom(QMainWindow):
 
     # ================== PLAY ==================
 
+    def open_external_files(self, paths):
+        """Explorer Open-with: show that folder and play the first file."""
+        paths = [p for p in (paths or []) if p and os.path.isfile(p)]
+        if not paths:
+            return
+        folder = os.path.dirname(paths[0])
+        if folder and os.path.isdir(folder):
+            self.show_directory(folder)
+        self.play_file(self._track_from_path(paths[0]))
+        self._bring_to_front()
+        self.track_status.setText(f"Opened {os.path.basename(paths[0])}")
+
+    def _bring_to_front(self):
+        try:
+            if self.isMinimized():
+                self.showNormal()
+            self.show()
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            pass
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.user32.SetForegroundWindow(int(self.winId()))
+            except Exception:
+                pass
+
+    def handle_ipc(self, text):
+        """Second launch sends a path here. No extra window."""
+        text = (text or "").strip()
+        self._bring_to_front()
+        paths = []
+        lines = text.splitlines()
+        if lines and lines[0].strip() == "PLAY":
+            lines = lines[1:]
+        elif lines and lines[0].strip() == "ACTIVATE":
+            self.track_status.setText("Already running")
+            return
+        for line in lines:
+            p = line.strip().strip('"')
+            if p and os.path.isfile(p):
+                paths.append(os.path.abspath(p))
+        if paths:
+            self.open_external_files(paths)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        paths = []
+        for url in event.mimeData().urls():
+            local = url.toLocalFile()
+            if local and os.path.isfile(local):
+                paths.append(local)
+        if paths:
+            self.open_external_files(paths)
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
+
     def play_file(self, track_or_path):
         if isinstance(track_or_path, dict):
             track = track_or_path
@@ -2178,7 +2443,7 @@ class MusicRoom(QMainWindow):
             log(f"[Play] Missing file skipped: {path}", 30)
             self.track_status.setText(f"Missing: {self.get_display_name(path)}")
             self._mark_now_playing(None)
-            if self.current_playlist and self.loop_mode == 2:
+            if self.current_playlist and self.loop_mode in (2, 3):
                 QTimer.singleShot(500, self.play_next_in_list)
             return
 
@@ -2203,11 +2468,13 @@ class MusicRoom(QMainWindow):
                 QTimer.singleShot(200, self.update_volume_to_actual)
                 self.current_file_path = path
                 self.current_track_info = track
+                self._dur_verified_path = None
+                self._dur_verified_ms = 0
                 self.current_engine = self.audio_engine.current_name or "cached"
                 self.spectrum_source_path = cached_wav
                 self._update_track_display(track)
                 self.track_status.setText("Playing (cached)")
-                prevent_sleep(True)
+                self._set_keep_awake(True)
                 self.add_to_history(path)
                 QTimer.singleShot(1000, lambda: self._fetch_and_cache_duration(path))
                 if self.current_playlist:
@@ -2232,6 +2499,8 @@ class MusicRoom(QMainWindow):
 
         self.current_file_path = path
         self.current_track_info = track
+        self._dur_verified_path = None
+        self._dur_verified_ms = 0
 
         if engine is None:
             ext = os.path.splitext(path)[1].lower()
@@ -2281,7 +2550,7 @@ class MusicRoom(QMainWindow):
         QTimer.singleShot(1000, lambda: self._fetch_and_cache_duration(path))
         self._update_track_display(track)
         self.track_status.setText("Playing")
-        prevent_sleep(True)
+        self._set_keep_awake(True)
         self.add_to_history(path)
         self.increment_play_count(path)
         self.load_cover_art(path)
@@ -2293,11 +2562,12 @@ class MusicRoom(QMainWindow):
             title = track.get("cue_title") or f"Track {track.get('cue_track_number', 0)}"
             performer = track.get("cue_performer") or ""
             if performer:
-                self.track_title.setText(f"{performer} - {title}")
+                shown = f"{performer} - {title}"
             else:
-                self.track_title.setText(title)
+                shown = title
+            self.track_title.setText(self._mask_emoji_for_ui(shown))
         else:
-            self.track_title.setText(self.get_display_name(path))
+            self.track_title.setText(self._mask_emoji_for_ui(self.get_display_name(path)))
         meta = self.read_metadata(track)
         if meta:
             artist = meta.get("artist") or "-"
@@ -2320,38 +2590,130 @@ class MusicRoom(QMainWindow):
         except Exception:
             pass
 
-    def _fetch_and_cache_duration(self, filepath):
-        if not filepath or filepath.startswith("http"):
+    def _fetch_and_cache_duration(self, filepath, live_ms=None):
+        if not filepath or str(filepath).startswith("http"):
+            return
+        if not os.path.isfile(filepath):
             return
         folder = os.path.dirname(filepath) + "/"
         fname = os.path.basename(filepath)
-        if folder in self.folder_cache:
-            for cf in self.folder_cache[folder]["files"]:
-                if cf["filename"] == fname and cf["duration_ms"] >= 0:
-                    if os.path.exists(filepath) and os.path.getmtime(filepath) == cf["mtime"]:
-                        return
-        dur_ms = -1
+        if live_ms is None:
+            try:
+                _, total_ms = self.audio_engine.get_time()
+                if total_ms and total_ms > 0:
+                    live_ms = int(total_ms)
+            except Exception:
+                live_ms = None
+        if not live_ms or live_ms <= 0:
+            return
+
         try:
-            _, total_ms = self.audio_engine.get_time()
-            if total_ms and total_ms > 0:
-                dur_ms = total_ms
-        except Exception:
-            pass
-        if dur_ms <= 0:
-            dur_ms = -1
+            mtime = os.path.getmtime(filepath)
+        except OSError:
+            return
+
+        cached = None
+        if folder in self.folder_cache:
+            for cf in self.folder_cache[folder].get("files") or []:
+                if cf.get("filename") == fname:
+                    cached = cf
+                    break
+
+        if (
+            cached
+            and cached.get("mtime") == mtime
+            and cached.get("duration_ms", -1) >= 0
+            and abs(int(cached["duration_ms"]) - int(live_ms)) <= 1000
+        ):
+            return
+
+        old = cached.get("duration_ms") if cached else None
+        log(f"[cache] rewrite duration {fname}: cached={old} live={live_ms} mtime={mtime}", 20)
+
         if folder not in self.folder_cache:
-            self.folder_cache[folder] = {"scanned_mtime": os.path.getmtime(folder), "files": []}
+            try:
+                scanned = os.path.getmtime(folder.rstrip("\\/"))
+            except OSError:
+                scanned = mtime
+            self.folder_cache[folder] = {"scanned_mtime": scanned, "files": []}
         cache_entry = self.folder_cache[folder]
-        cache_entry["files"] = [cf for cf in cache_entry["files"] if cf["filename"] != fname]
+        cache_entry["files"] = [cf for cf in cache_entry.get("files") or [] if cf.get("filename") != fname]
         cache_entry["files"].append({
             "filename": fname,
-            "duration_ms": dur_ms,
-            "mtime": os.path.getmtime(filepath) if dur_ms >= 0 else 0
+            "duration_ms": int(live_ms),
+            "mtime": mtime,
         })
-        cache_entry["scanned_mtime"] = os.path.getmtime(folder)
+        try:
+            cache_entry["scanned_mtime"] = os.path.getmtime(folder.rstrip("\\/"))
+        except OSError:
+            cache_entry["scanned_mtime"] = mtime
         self._mark_cache_dirty()
-        if self.current_dir == os.path.dirname(filepath):
-            self._update_item_duration(fname, dur_ms)
+        self._update_item_duration(fname, int(live_ms), filepath=filepath)
+
+    def _collect_scan_paths(self):
+        # F10: only the folder the user is currently browsing (not All / Cached Songs).
+        folder = self.current_dir
+        if not folder or not os.path.isdir(folder):
+            return []
+        paths = []
+        try:
+            names = os.listdir(folder)
+        except OSError:
+            return []
+        for name in names:
+            p = os.path.join(folder, name)
+            if not os.path.isfile(p):
+                continue
+            if not name.lower().endswith(self.AUDIO_EXTS):
+                continue
+            paths.append(p)
+        paths.sort(key=lambda x: os.path.basename(x).lower())
+        return paths
+
+    def start_duration_scan(self):
+        if self._scan_queue:
+            self._scan_queue = []
+            self.track_status.setText("Duration scan cancelled")
+            log("[Scan] cancelled", 20)
+            return
+        if not self.current_dir or not os.path.isdir(self.current_dir):
+            self.track_status.setText("F10: open a music folder first")
+            return
+        paths = self._collect_scan_paths()
+        if not paths:
+            self.track_status.setText("No audio files in this folder")
+            return
+        self._scan_queue = list(paths)
+        self._scan_total = len(paths)
+        self._scan_done = 0
+        self._scan_ok = 0
+        folder_name = os.path.basename(self.current_dir.rstrip("\\/")) or self.current_dir
+        self.track_status.setText(f"Scan {folder_name}: 0/{self._scan_total}")
+        log(f"[Scan] folder={self.current_dir} files={self._scan_total}", 20)
+        QTimer.singleShot(0, self._scan_duration_step)
+
+    def _scan_duration_step(self):
+        if not self._scan_queue:
+            return
+        batch = 0
+        while self._scan_queue and batch < 5:
+            path = self._scan_queue.pop(0)
+            self._scan_done += 1
+            batch += 1
+            ms = probe_file_duration_ms(path)
+            if ms > 0:
+                self._scan_ok += 1
+                self._fetch_and_cache_duration(path, live_ms=ms)
+        if self._scan_queue:
+            self.track_status.setText(
+                f"Scan this folder: {self._scan_done}/{self._scan_total}")
+            QTimer.singleShot(0, self._scan_duration_step)
+        else:
+            self._write_cache()
+            self.track_status.setText(
+                f"Cached {self._scan_ok}/{self._scan_total} in this folder"
+                "  (MOD/MIDI when played)")
+            log(f"[Scan] done ok={self._scan_ok}/{self._scan_total} dir={self.current_dir}", 20)
     def increment_play_count(self, filepath):
         if filepath:
             self.play_counts[filepath] = self.play_counts.get(filepath, 0) + 1
@@ -2375,7 +2737,7 @@ class MusicRoom(QMainWindow):
             if self.current_track_info:
                 self._update_track_display(self.current_track_info)
             self.track_status.setText("Playing")
-            prevent_sleep(True)
+            self._set_keep_awake(True)
             self._media_end_handled = False
         else:
             self.track_status.setText("Cannot play - converter failed")
@@ -2383,11 +2745,11 @@ class MusicRoom(QMainWindow):
     def toggle_pause(self):
         if self.audio_engine.is_playing():
             self.audio_engine.pause()
-            prevent_sleep(False)
+            self._set_keep_awake(False)
             self.track_status.setText("Paused")
         elif self.audio_engine.is_paused():
             self.audio_engine.resume()
-            prevent_sleep(True)
+            self._set_keep_awake(True)
             self.track_status.setText("Playing")
 
     def adjust_volume(self, delta):
@@ -2410,21 +2772,30 @@ class MusicRoom(QMainWindow):
         self._media_end_handled = True
         if self.loop_mode == 1 and self.current_track_info:
             self.play_file(self.current_track_info)
-        elif self.loop_mode == 2 and self.current_playlist:
+        elif self.loop_mode in (2, 3) and self.current_playlist:
             self.play_next_in_list()
         else:
-            prevent_sleep(False)
+            self._set_keep_awake(False)
             self.track_status.setText("Stopped")
             self._mark_now_playing(None)
+
     def play_next_in_list(self):
         if not self.current_playlist:
             return
         n = len(self.current_playlist)
-        for step in range(1, n + 1):
-            idx = (self.current_track_index + step) % n
+        if n <= 0:
+            return
+        if self.loop_mode == 3:
+            order = list(range(n))
+            random.shuffle(order)
+            if n > 1 and self.current_track_index in order:
+                order.remove(self.current_track_index)
+        else:
+            order = [((self.current_track_index + step) % n) for step in range(1, n + 1)]
+        for idx in order:
             track = self.current_playlist[idx]
             p = track.get("path") if isinstance(track, dict) else track
-            if p and (p.startswith("http") or os.path.isfile(p)):
+            if p and (str(p).startswith("http") or os.path.isfile(p)):
                 self.current_track_index = idx
                 self.play_file(track)
                 return
@@ -2526,6 +2897,14 @@ class MusicRoom(QMainWindow):
             item = QListWidgetItem("[MOST] Most Played")
             item.setData(Qt.ItemDataRole.UserRole, {"path": "MOST_PLAYED", "is_source": True})
             self.file_list.addItem(item)
+        if self.folder_cache:
+            n_cached = 0
+            for payload in self.folder_cache.values():
+                if isinstance(payload, dict):
+                    n_cached += len(payload.get("files") or [])
+            item = QListWidgetItem(f"[CACHE] Cached Songs ({n_cached})")
+            item.setData(Qt.ItemDataRole.UserRole, {"path": "ALL_SONGS", "is_source": True})
+            self.file_list.addItem(item)
         if self.file_list.count() > 0:
             self.file_list.setCurrentRow(0)
         self.path_label.setText("-")
@@ -2550,6 +2929,52 @@ class MusicRoom(QMainWindow):
         if self.file_list.count() > 0:
             self.file_list.setCurrentRow(0)
         self.path_label.setText("MOST PLAYED")
+        self.file_list.setUpdatesEnabled(True)
+        self.update_now_playing_marker()
+
+    def show_all_songs_list(self):
+        # Lists files already in duration cache — not a live scan of every music folder.
+        log("[UI] show_all_songs_list", 20)
+        self.current_dir = "ALL_SONGS"
+        self.file_list.setUpdatesEnabled(False)
+        self.file_list.clear()
+        self.current_playlist = []
+        self.current_track_index = -1
+        back = QListWidgetItem("[..]  (GO BACK)")
+        back.setData(Qt.ItemDataRole.UserRole, {"path": "ACTION_BACK"})
+        self.file_list.addItem(back)
+
+        seen = set()
+        tracks = []
+        for folder, payload in (self.folder_cache or {}).items():
+            if not isinstance(payload, dict):
+                continue
+            base = str(folder).rstrip("\\/")
+            for cf in payload.get("files") or []:
+                fname = cf.get("filename") if isinstance(cf, dict) else None
+                if not fname:
+                    continue
+                if not fname.lower().endswith(self.AUDIO_EXTS):
+                    continue
+                path = os.path.join(base, fname)
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    key = os.path.normcase(os.path.abspath(path))
+                except Exception:
+                    key = path
+                if key in seen:
+                    continue
+                seen.add(key)
+                tracks.append(self._track_from_path(path))
+        tracks.sort(key=lambda t: self.get_display_name(t.get("path", "")).lower())
+        for track in tracks:
+            self.file_list.addItem(self._make_item(track))
+            self.current_playlist.append(track)
+        if self.file_list.count() > 0:
+            self.file_list.setCurrentRow(0)
+        self.path_label.setText(f"CACHED SONGS ({len(tracks)})")
+        self.track_status.setText("From duration cache" if tracks else "Cache empty — browse folders first")
         self.file_list.setUpdatesEnabled(True)
         self.update_now_playing_marker()
 
@@ -2663,13 +3088,7 @@ class MusicRoom(QMainWindow):
 
         try:
             entries = sorted(os.listdir(path))
-            valid_ext = (
-                '.mp3', '.wav', '.ogg', '.m4a', '.flac',
-                '.dnm', '.ftm', '.it', '.mid', '.midi', '.mod',
-                '.mptm', '.mt2', '.rmi', '.s3m', '.sap', '.sid',
-                '.tm8', '.xm', '.vgm', '.vgz', '.swf',
-                '.opus', '.alac', '.aac', '.wma'
-            )
+            valid_ext = self.AUDIO_EXTS
             folders = [e for e in entries if os.path.isdir(os.path.join(path, e))]
             files = [e for e in entries if e.lower().endswith(valid_ext)]
             cue_files = [e for e in entries if e.lower().endswith(('.cue', '.cue.txt'))]
@@ -2709,26 +3128,43 @@ class MusicRoom(QMainWindow):
         self.path_label.setText(path)
         self.file_list.setUpdatesEnabled(True)
 
-    def _update_item_duration(self, filename, dur_ms):
+    def _update_item_duration(self, filename, dur_ms, filepath=None):
+        want = None
+        if filepath:
+            try:
+                want = os.path.normcase(os.path.abspath(filepath))
+            except Exception:
+                want = filepath
         for idx in range(self.file_list.count()):
             item = self.file_list.item(idx)
             t = item.data(Qt.ItemDataRole.UserRole)
             if not isinstance(t, dict):
                 continue
             target = t.get("path")
-            if target and os.path.basename(target) == filename:
-                text = item.text()
-                prefix = ""
-                if text.startswith("▶ "):
-                    prefix = "▶ "
-                    text = text[2:]
-                if text.startswith("[AUD"):
-                    rest = text.split("]", 1)[1] if "]" in text else " " + filename.lower()
-                else:
-                    rest = " " + filename.lower()
-                tag = self._make_audio_tag(dur_ms, self.show_duration)
-                item.setText(f"{prefix}{tag}{rest}")
-                break
+            if not target:
+                continue
+            hit = False
+            if want:
+                try:
+                    hit = os.path.normcase(os.path.abspath(target)) == want
+                except Exception:
+                    hit = target == filepath
+            else:
+                hit = os.path.basename(target) == filename
+            if not hit:
+                continue
+            text = item.text()
+            prefix = ""
+            if text.startswith("▶ "):
+                prefix = "▶ "
+                text = text[2:]
+            if text.startswith("[AUD"):
+                rest = text.split("]", 1)[1] if "]" in text else " " + filename.lower()
+            else:
+                rest = " " + filename.lower()
+            tag = self._make_audio_tag(dur_ms, self.show_duration)
+            item.setText(f"{prefix}{tag}{rest}")
+            break
 
     def refresh_current_directory(self):
         if self.current_dir and os.path.isdir(self.current_dir):
@@ -2741,6 +3177,8 @@ class MusicRoom(QMainWindow):
             self.show_history_list()
         elif self.current_dir == "MOST_PLAYED":
             self.show_most_played_list()
+        elif self.current_dir == "ALL_SONGS":
+            self.show_all_songs_list()
         elif self.current_dir and self.current_dir.startswith("FAVORITES:"):
             self.show_favorites_list(self.current_dir.split(":")[1])
         else:
@@ -2761,6 +3199,8 @@ class MusicRoom(QMainWindow):
                 self.show_history_list()
             elif p == "MOST_PLAYED":
                 self.show_most_played_list()
+            elif p == "ALL_SONGS":
+                self.show_all_songs_list()
             elif p.startswith("FAVORITES:"):
                 self.show_favorites_list(p.split(":")[1])
             elif p.startswith("http"):
@@ -2787,25 +3227,25 @@ class MusicRoom(QMainWindow):
     def go_back(self):
         if self.current_dir is None:
             return
-        if self.current_dir in ("HISTORY", "MOST_PLAYED") or self.current_dir.startswith("FAVORITES:"):
+        if self.current_dir in ("HISTORY", "MOST_PLAYED", "ALL_SONGS") or self.current_dir.startswith("FAVORITES:"):
             self.show_source_list()
         elif self.current_dir.startswith("CUE:"):
             cue_path = self.current_dir[4:]
             parent_dir = os.path.dirname(cue_path)
-            if any(os.path.abspath(parent_dir) == os.path.abspath(p) for p in self.source_paths) or parent_dir == cue_path:
+            if any(same_path(parent_dir, p) for p in self.source_paths) or parent_dir == cue_path:
                 self.show_source_list()
             else:
                 self.show_directory(parent_dir)
         elif self.current_dir.startswith("M3U:"):
             m3u_path = self.current_dir[4:]
             parent_dir = os.path.dirname(m3u_path)
-            if any(os.path.abspath(parent_dir) == os.path.abspath(p) for p in self.source_paths) or parent_dir == m3u_path:
+            if any(same_path(parent_dir, p) for p in self.source_paths) or parent_dir == m3u_path:
                 self.show_source_list()
             else:
                 self.show_directory(parent_dir)
         else:
             parent = os.path.dirname(self.current_dir)
-            if os.path.abspath(self.current_dir) in [os.path.abspath(p) for p in self.source_paths] or parent == self.current_dir:
+            if any(same_path(self.current_dir, p) for p in self.source_paths) or parent == self.current_dir:
                 self.show_source_list()
             else:
                 self.show_directory(parent)
@@ -2879,8 +3319,20 @@ class MusicRoom(QMainWindow):
         total_str = self.format_time(total_ms) if total_ms and total_ms > 0 else self._time_placeholder()
         bar_text = self.progress_text.text().split("]")[0] + "]"
         self.progress_text.setText(f"{bar_text} {curr_str} / {total_str}")
+        if (
+            self.current_file_path
+            and total_ms
+            and total_ms > 1000
+            and (
+                self._dur_verified_path != self.current_file_path
+                or abs(getattr(self, "_dur_verified_ms", 0) - int(total_ms)) > 1000
+            )
+        ):
+            self._dur_verified_path = self.current_file_path
+            self._dur_verified_ms = int(total_ms)
+            self._fetch_and_cache_duration(self.current_file_path, live_ms=int(total_ms))
         if self.current_file_path:
-            track_name = self.get_display_name(self.current_file_path)
+            track_name = self._mask_emoji_for_ui(self.get_display_name(self.current_file_path))
             self.tray_icon.setToolTip(f"dem_player - {track_name}")
         else:
             self.tray_icon.setToolTip(f"dem_player {APP_VERSION}")
@@ -2920,6 +3372,71 @@ class MusicRoom(QMainWindow):
         super().closeEvent(event)
 
 
+def _files_from_argv(argv):
+    """Paths passed by Explorer 'Open with' / drag onto the exe."""
+    found = []
+    for arg in argv[1:]:
+        if not arg or arg.startswith("-"):
+            continue
+        path = os.path.abspath(os.path.expanduser(arg.strip('"')))
+        if os.path.isfile(path):
+            found.append(path)
+    return found
+
+
+def _ipc_send(paths) -> bool:
+    """True if another dem_player is already open and accepted this request."""
+    try:
+        from PySide6.QtNetwork import QLocalSocket
+        sock = QLocalSocket()
+        sock.connectToServer(IPC_NAME)
+        if not sock.waitForConnected(300):
+            return False
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)
+            except Exception:
+                pass
+        body = ("PLAY\n" + "\n".join(paths)) if paths else "ACTIVATE"
+        sock.write(body.encode("utf-8"))
+        sock.flush()
+        sock.waitForBytesWritten(500)
+        sock.disconnectFromServer()
+        return True
+    except Exception as e:
+        log(f"[IPC] send failed: {e}", 30)
+        return False
+
+
+class _IpcHub(QObject):
+    def __init__(self):
+        super().__init__()
+        from PySide6.QtNetwork import QLocalServer
+        self.win = None
+        self.pending = []
+        QLocalServer.removeServer(IPC_NAME)
+        self.server = QLocalServer(self)
+        self.server.newConnection.connect(self._on_conn)
+        if not self.server.listen(IPC_NAME):
+            log(f"[IPC] listen failed: {self.server.errorString()}", 30)
+
+    def _on_conn(self):
+        sock = self.server.nextPendingConnection()
+        if sock is None:
+            return
+        sock.waitForReadyRead(800)
+        text = bytes(sock.readAll()).decode("utf-8", "replace")
+        try:
+            sock.disconnectFromServer()
+        except Exception:
+            pass
+        if self.win is None:
+            self.pending.append(text)
+        else:
+            self.win.handle_ipc(text)
+
+
 if __name__ == "__main__":
     try:
         apply_cpu_affinity()
@@ -2932,18 +3449,29 @@ if __name__ == "__main__":
         log(f"HISTORY_FILE = {HISTORY_FILE}", 20)
         log(f"CACHE_FILE = {CACHE_FILE}", 20)
         log(f"Python {sys.version}, Platform: {sys.platform}", 20)
-        log(f"Frozen={getattr(sys, 'frozen', False)}, numpy={HAS_NUMPY}, sounddevice={HAS_SOUNDDEVICE}, mutagen={HAS_MUTAGEN}", 20)
+        log(f"Frozen={getattr(sys, 'frozen', False)}, mutagen={HAS_MUTAGEN}", 20)
         os.environ["QT_OPENGL"] = "software"
         if sys.platform == "win32":
             os.environ["QT_QPA_PLATFORM"] = "windows"
         os.environ["QT_SCALE_FACTOR"] = "1"
         log("Qt environment set", 20)
         app = QApplication(sys.argv)
+        opened = _files_from_argv(sys.argv)
+        if _ipc_send(opened):
+            log("[IPC] handed off to the open window", 20)
+            sys.exit(0)
+        hub = _IpcHub()
         icon_path = resource_path("FPT.ico")
         if os.path.exists(icon_path):
             app.setWindowIcon(QIcon(icon_path))
         win = MusicRoom()
+        hub.win = win
         win.show()
+        QTimer.singleShot(50, win._apply_aero_blur)
+        if opened:
+            QTimer.singleShot(150, lambda paths=opened: win.open_external_files(paths))
+        for msg in hub.pending:
+            win.handle_ipc(msg)
         log("Window shown successfully", 20)
         sys.exit(app.exec())
     except Exception as e:
