@@ -10,7 +10,7 @@ import re
 import sys
 import time
 
-APP_VERSION = "0.21.5"
+APP_VERSION = "0.22.3"
 
 TIME_FORMAT_MM_SS = "mm_ss"
 TIME_FORMAT_MM_SS_CC = "mm_ss_cc"
@@ -22,11 +22,38 @@ except ImportError:
     HAS_MUTAGEN = False
 
 
+def probe_file_duration_ms(path: str) -> int:
+    """Read length from tags without playing. -1 if unknown."""
+    if not path or not os.path.isfile(path):
+        return -1
+    if not HAS_MUTAGEN:
+        return -1
+    try:
+        audio = MutagenFile(path)
+        info = getattr(audio, "info", None) if audio is not None else None
+        length = getattr(info, "length", None) if info is not None else None
+        if length and float(length) > 0:
+            return int(float(length) * 1000)
+    except Exception:
+        pass
+    return -1
+
+
 # ---------- paths ----------
 def app_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def same_path(a, b) -> bool:
+    """True if a and b are the same file. Windows is case-insensitive, so use normcase."""
+    if not a or not b:
+        return False
+    try:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    except Exception:
+        return a == b
 
 
 def data_dir() -> str:
@@ -145,6 +172,157 @@ def prevent_sleep(enable: bool) -> None:
             ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
     except Exception:
         pass
+
+
+_OPEN_WITH_EXTS = (
+    "mp3", "wav", "flac", "ogg", "m4a", "aac", "wma", "opus", "ac3",
+    "mid", "midi", "rmi", "kar",
+    "mod", "xm", "it", "s3m", "mptm", "mpt", "mt2", "stm",
+    "ftm", "dnm", "sap", "sid", "tm8", "vgm", "vgz",
+)
+
+
+def player_launch_command() -> str:
+    """Command line Explorer should run for 'Open with dem_player'."""
+    if getattr(sys, "frozen", False):
+        return f'"{os.path.abspath(sys.executable)}" "%1"'
+    script = os.path.abspath(sys.argv[0] if sys.argv else "main.py")
+    return f'"{os.path.abspath(sys.executable)}" "{script}" "%1"'
+
+
+def register_open_with() -> tuple:
+    """HKCU only. Does not steal the default player. Returns (count, command)."""
+    if sys.platform != "win32":
+        raise OSError("Windows only")
+    import winreg
+    cmd = player_launch_command()
+    app = r"Software\Classes\Applications\dem_player.exe"
+    with winreg.CreateKey(winreg.HKCU, app + r"\shell\open\command") as k:
+        winreg.SetValueEx(k, "", 0, winreg.REG_SZ, cmd)
+    with winreg.CreateKey(winreg.HKCU, app) as k:
+        winreg.SetValueEx(k, "FriendlyAppName", 0, winreg.REG_SZ, "dem_player")
+    with winreg.CreateKey(winreg.HKCU, app + r"\SupportedTypes") as k:
+        for ext in _OPEN_WITH_EXTS:
+            winreg.SetValueEx(k, "." + ext, 0, winreg.REG_SZ, "")
+    for ext in _OPEN_WITH_EXTS:
+        winreg.CreateKey(winreg.HKCU, rf"Software\Classes\.{ext}\OpenWithList\dem_player.exe").Close()
+    log(f"[OpenWith] registered {cmd}", 20)
+    return len(_OPEN_WITH_EXTS), cmd
+
+
+def apply_window_blur(hwnd, enable: bool = False, opacity: int = 40, kind: str | None = None) -> bool:
+    """kind: 'aero' frosted, 'qt' turn DWM glass off and leave Qt's layered bit alone, 'off' solid.
+
+    'qt' is the 0.20 transparent path: no acrylic, no accent gradient.
+    """
+    if kind is None:
+        kind = "aero" if enable else "off"
+    if sys.platform != "win32":
+        return False
+    try:
+        hwnd = int(hwnd)
+    except Exception:
+        return False
+
+    user32 = ctypes.windll.user32
+    dwmapi = ctypes.windll.dwmapi
+    ok = False
+
+    GWL_EXSTYLE = -20
+    WS_EX_LAYERED = 0x00080000
+    try:
+        get_long = user32.GetWindowLongPtrW
+        set_long = user32.SetWindowLongPtrW
+    except Exception:
+        get_long = user32.GetWindowLongW
+        set_long = user32.SetWindowLongW
+    try:
+        if kind != "qt":
+            ex = get_long(hwnd, GWL_EXSTYLE)
+            if kind == "aero":
+                set_long(hwnd, GWL_EXSTYLE, ex | WS_EX_LAYERED)
+            elif ex & WS_EX_LAYERED:
+                set_long(hwnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED)
+    except Exception as e:
+        log(f"[DWM] layered: {e}", 30)
+
+    try:
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        DWMWA_SYSTEMBACKDROP_TYPE = 38
+        # 1 = DWMSBT_NONE. 3 = acrylic. Only aero may set 3.
+        backdrop_value = 3 if kind == "aero" else 1
+        dark = ctypes.c_int(1 if kind == "aero" else 0)
+        dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(dark), ctypes.sizeof(dark))
+        backdrop = ctypes.c_int(backdrop_value)
+        dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_SYSTEMBACKDROP_TYPE, ctypes.byref(backdrop), ctypes.sizeof(backdrop))
+        ok = True
+    except Exception as e:
+        log(f"[DWM] backdrop: {e}", 30)
+
+    class ACCENTPOLICY(ctypes.Structure):
+        _fields_ = [
+            ("AccentState", ctypes.c_int),
+            ("AccentFlags", ctypes.c_int),
+            ("GradientColor", ctypes.c_uint32),
+            ("AnimationId", ctypes.c_int),
+        ]
+
+    class WINCOMPATTRDATA(ctypes.Structure):
+        _fields_ = [
+            ("Attribute", ctypes.c_int),
+            ("Data", ctypes.POINTER(ACCENTPOLICY)),
+            ("SizeOfData", ctypes.c_size_t),
+        ]
+
+    try:
+        accent = ACCENTPOLICY()
+        if kind == "aero":
+            accent.AccentState = 4  # acrylic blur
+            accent.AccentFlags = 0x20 | 0x40 | 0x80 | 0x100
+            op = max(0, min(100, int(opacity)))
+            alpha = max(16, min(230, int(round(16 + op * 2.14))))
+            accent.GradientColor = (alpha << 24) | 0x00101010
+        else:
+            # 0 = disabled. Do not use 2 (transparent gradient): Win11 draws that as glass.
+            accent.AccentState = 0
+            accent.AccentFlags = 0
+            accent.GradientColor = 0
+        data = WINCOMPATTRDATA()
+        data.Attribute = 19
+        data.Data = ctypes.pointer(accent)
+        data.SizeOfData = ctypes.sizeof(accent)
+        user32.SetWindowCompositionAttribute(hwnd, ctypes.byref(data))
+        ok = True
+    except Exception as e:
+        log(f"[DWM] composition: {e}", 30)
+
+    try:
+        class DWM_BLURBEHIND(ctypes.Structure):
+            _fields_ = [
+                ("dwFlags", ctypes.c_uint),
+                ("fEnable", ctypes.c_int),
+                ("hRgnBlur", ctypes.c_void_p),
+                ("fTransitionOnMaximized", ctypes.c_int),
+            ]
+
+        class MARGINS(ctypes.Structure):
+            _fields_ = [
+                ("cxLeftWidth", ctypes.c_int),
+                ("cxRightWidth", ctypes.c_int),
+                ("cyTopHeight", ctypes.c_int),
+                ("cyBottomHeight", ctypes.c_int),
+            ]
+
+        bb = DWM_BLURBEHIND(1, 1 if kind == "aero" else 0, None, 0)
+        dwmapi.DwmEnableBlurBehindWindow(hwnd, ctypes.byref(bb))
+        m = MARGINS(-1, -1, -1, -1) if kind == "aero" else MARGINS(0, 0, 0, 0)
+        dwmapi.DwmExtendFrameIntoClientArea(hwnd, ctypes.byref(m))
+        ok = True
+    except Exception as e:
+        log(f"[DWM] blurbehind: {e}", 30)
+    return ok
 
 
 def apply_cpu_affinity() -> None:
