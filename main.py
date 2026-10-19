@@ -1,6 +1,7 @@
-"""dem_player 0.21 — PySide6 UI. Playback via audio.AudioEngine (no VLC / no BASS)."""
+"""dem_player 0.22.5 — PySide6 UI. Playback via audio.AudioEngine"""
 import sys
 import os
+import html
 import shutil
 import re
 import traceback
@@ -323,7 +324,15 @@ class AboutDialog(QDialog):
 
         self.text = QTextEdit()
         self.text.setReadOnly(True)
-        self.text.setPlainText(info_text)
+        escaped = html.escape(info_text)
+        url = "https://github.com/999jjkl/dem_player"
+        escaped = escaped.replace(
+            url,
+            f'<a href="{url}">{url}</a>',
+        )
+        self.text.setHtml(f"<pre>{escaped}</pre>")
+        self.text.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.text.setOpenExternalLinks(True)
         if font is not None:
             self.text.setFont(font)
         self.text.setStyleSheet(
@@ -1469,6 +1478,7 @@ class MusicRoom(QMainWindow):
 
         lines = []
         lines.append(f"dem_player {APP_VERSION}")
+        lines.append("https://github.com/999jjkl/dem_player")
         lines.append("")
         lines.append("--- Environment ---")
         lines.append(f"Python      : {sys.version.splitlines()[0]}")
@@ -2369,12 +2379,23 @@ class MusicRoom(QMainWindow):
         paths = [p for p in (paths or []) if p and os.path.isfile(p)]
         if not paths:
             return
+        if len(paths) == 1 and paths[0].lower().endswith((".m3u", ".m3u8")):
+            self._open_m3u(paths[0])
+            self._bring_to_front()
+            return
         folder = os.path.dirname(paths[0])
         if folder and os.path.isdir(folder):
             self.show_directory(folder)
         self.play_file(self._track_from_path(paths[0]))
         self._bring_to_front()
         self.track_status.setText(f"Opened {os.path.basename(paths[0])}")
+
+    def _open_m3u(self, path):
+        self.show_m3u_list(path)
+        if not self.current_playlist:
+            self.track_status.setText("M3U has no playable stream or file")
+            return
+        self.play_file(self.current_playlist[0])
 
     def _bring_to_front(self):
         try:
@@ -2439,7 +2460,13 @@ class MusicRoom(QMainWindow):
             self.track_status.setText("Cannot play - missing path")
             return
 
-        if not path.startswith("http") and not os.path.isfile(path):
+        if (not str(path).lower().startswith(("http://", "https://", "mms://", "rtmp://", "rtsp://"))
+                and str(path).lower().endswith((".m3u", ".m3u8"))
+                and os.path.isfile(path)):
+            self._open_m3u(path)
+            return
+
+        if not path.startswith("http") and not path.lower().startswith(("mms://", "rtmp://", "rtsp://")) and not os.path.isfile(path):
             log(f"[Play] Missing file skipped: {path}", 30)
             self.track_status.setText(f"Missing: {self.get_display_name(path)}")
             self._mark_now_playing(None)
@@ -3035,6 +3062,8 @@ class MusicRoom(QMainWindow):
         if self.file_list.count() > 0:
             self.file_list.setCurrentRow(0)
         self.path_label.setText(f"M3U: {os.path.basename(m3u_path)}")
+        if not self.current_playlist:
+            self.track_status.setText("M3U has no playable stream or file")
         self.file_list.setUpdatesEnabled(True)
         self.update_now_playing_marker()
 
