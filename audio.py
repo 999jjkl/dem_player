@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import array
 import os
+import queue
 import re
 import struct
 import subprocess
@@ -237,6 +238,11 @@ def list_output_devices():
     _DEVICE_CACHE = results
     _DEVICE_CACHE_AT = now
     return list(results)
+
+
+def _is_stream_url(path: str) -> bool:
+    p = str(path or "").strip().lower()
+    return p.startswith(("http://", "https://", "mms://", "mmsh://", "rtmp://", "rtmps://", "rtsp://"))
 
 
 def _find_device_id(name: str):
@@ -964,14 +970,18 @@ class MiniaudioBackend(AudioBackend):
 
 
 class FFmpegBackend(MiniaudioBackend):
-    """Decode M4A/AAC/WMA/APE/Opus via ffmpeg CLI → temp WAV → miniaudio."""
+    """Local files: ffmpeg → WAV. Stream URLs: ffmpeg PCM pipe (live radio / HLS)."""
 
     def __init__(self, device_name="", on_end=None):
         super().__init__(device_name=device_name, on_end=on_end)
         self._tmp = None
+        self._proc = None
+        self._pcm_q = None
 
     def play(self, filepath, start_ms=0):
-        # If this is a seek on the WAV we already rendered, do not re-decode.
+        if _is_stream_url(filepath):
+            return self._play_url(filepath, start_ms=start_ms)
+        self._kill_ffmpeg()
         if self._tmp and os.path.isfile(self._tmp) and same_path(filepath, self._tmp):
             return super().play(filepath, start_ms=start_ms)
         wav = self._decode_to_wav(filepath)
@@ -989,13 +999,170 @@ class FFmpegBackend(MiniaudioBackend):
             _cleanup_file(old)
         return ok
 
-    def _decode_to_wav(self, filepath):
-        wav = _ffmpeg_decode_to_wav(filepath)
-        if not wav:
-            self.last_error = "ffmpeg cannot decode this file (is ffmpeg.exe next to the player?)"
-        return wav
+    def _kill_ffmpeg(self):
+        proc = self._proc
+        self._proc = None
+        if proc is None:
+            return
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=1)
+        except Exception:
+            pass
+
+    def _ffmpeg_reader(self, proc, q):
+        try:
+            out = proc.stdout
+            while out is not None:
+                data = out.read(8192)
+                if not data:
+                    break
+                while True:
+                    try:
+                        q.put(data, timeout=0.2)
+                        break
+                    except queue.Full:
+                        if self._proc is not proc:
+                            return
+        except Exception as e:
+            log(f"[ffmpeg] stream read: {e}", 30)
+        try:
+            q.put(None, timeout=0.5)
+        except Exception:
+            pass
+
+    def _ffmpeg_err(self, proc):
+        try:
+            err = proc.stderr.read() if proc.stderr else b""
+            if err:
+                log("[ffmpeg] " + err[-400:].decode("utf-8", "ignore").strip(), 30)
+        except Exception:
+            pass
+
+    def _play_url(self, url, start_ms=0):
+        if not HAS_MINIAUDIO:
+            self.last_error = "miniaudio not installed"
+            return False
+        exe = _ffmpeg_bin()
+        if not exe:
+            self.last_error = "need ffmpeg.exe next to the player to play stream URLs"
+            return False
+        self._kill_ffmpeg()
+        self._stop_device(close=False)
+        cmd = [exe, "-nostdin", "-hide_banner", "-loglevel", "error"]
+        if start_ms and int(start_ms) > 0:
+            cmd += ["-ss", f"{int(start_ms) / 1000.0:.3f}"]
+        cmd += [
+            "-i", url, "-vn",
+            "-f", "s16le", "-acodec", "pcm_s16le",
+            "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS),
+            "pipe:1",
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=0, **subprocess_hidden_kwargs(),
+            )
+        except Exception as e:
+            self.last_error = f"ffmpeg: {e}"
+            log(f"[ffmpeg] stream start failed: {e}", 40)
+            return False
+        q = queue.Queue(maxsize=32)
+        self._proc = proc
+        self._pcm_q = q
+        threading.Thread(target=self._ffmpeg_reader, args=(proc, q), daemon=True).start()
+        threading.Thread(target=self._ffmpeg_err, args=(proc,), daemon=True).start()
+
+        self._filepath = url
+        self._start_ms = start_ms or 0
+        self._sample_rate = SAMPLE_RATE
+        self._total_frames = 0
+        self._frames_played = 0
+        self._stopped = False
+        self._paused = False
+        self._ended = False
+        self._end_sent = False
+        self._last_amp = 0.0
+        wrapped = self._url_generator()
+        try:
+            next(wrapped)
+        except StopIteration:
+            self._kill_ffmpeg()
+            self.last_error = "empty stream"
+            return False
+        if not self._start_device(wrapped):
+            self._kill_ffmpeg()
+            return False
+        self.last_error = ""
+        log(f"[ffmpeg] streaming {url}", 20)
+        return True
+
+    def _url_generator(self):
+        paused_silence = array.array("h", [0] * (1024 * CHANNELS))
+        pending = b""
+
+        def gen():
+            nonlocal pending
+            num_frames = yield b""
+            try:
+                while True:
+                    with self._lock:
+                        if self._stopped:
+                            return
+                        paused = self._paused
+                        vol = self._volume
+                    if paused:
+                        num_frames = yield paused_silence
+                        continue
+                    want = max(1, int(num_frames or 1024)) * CHANNELS * 2
+                    q = self._pcm_q
+                    while len(pending) < want:
+                        if q is None:
+                            self._ended = True
+                            self._fire_end()
+                            return
+                        try:
+                            chunk = q.get(timeout=0.3)
+                        except queue.Empty:
+                            proc = self._proc
+                            if proc is not None and proc.poll() is not None and q.empty() and not pending:
+                                self._ended = True
+                                self._fire_end()
+                                return
+                            num_frames = yield paused_silence
+                            break
+                        if chunk is None:
+                            if not pending:
+                                self._ended = True
+                                self._fire_end()
+                                return
+                            break
+                        pending += chunk
+                    else:
+                        data = pending[:want]
+                        pending = pending[want:]
+                        if len(data) % 2:
+                            pending = data[-1:] + pending
+                            data = data[:-1]
+                        if not data:
+                            num_frames = yield paused_silence
+                            continue
+                        samples = self._shape_chunk(array.array("h", data), vol)
+                        n = len(samples)
+                        if n:
+                            self._frames_played += n // CHANNELS
+                        num_frames = yield samples
+                        continue
+            except GeneratorExit:
+                return
+
+        return gen()
 
     def stop(self):
+        self._kill_ffmpeg()
         super().stop()
         if self._tmp and os.path.exists(self._tmp):
             try:
@@ -1003,6 +1170,16 @@ class FFmpegBackend(MiniaudioBackend):
             except Exception:
                 pass
             self._tmp = None
+
+    def free(self):
+        self._kill_ffmpeg()
+        super().free()
+
+    def _decode_to_wav(self, filepath):
+        wav = _ffmpeg_decode_to_wav(filepath)
+        if not wav:
+            self.last_error = "ffmpeg cannot decode this file (is ffmpeg.exe next to the player?)"
+        return wav
 
 
 class OpenMptBackend(MiniaudioBackend):
@@ -1409,7 +1586,7 @@ class AudioEngine:
         return MiniaudioBackend(**kwargs)
 
     def pick_kind(self, filepath: str) -> str:
-        if str(filepath).lower().startswith(("http://", "https://")):
+        if str(filepath).lower().startswith(("http://", "https://", "mms://", "mmsh://", "rtmp://", "rtmps://", "rtsp://")):
             return "ffmpeg"
         ext = os.path.splitext(filepath)[1].lower()
         if ext in MIDI_EXT:
@@ -1431,7 +1608,8 @@ class AudioEngine:
         elif kind == "fluidsynth":
             pass
         elif kind == "ffmpeg":
-            order.append("miniaudio")
+            if not _is_stream_url(filepath):
+                order.append("miniaudio")
         elif kind == "miniaudio":
             order.append("ffmpeg")
         # Same backend: reuse the already-open playback device.
