@@ -1,7 +1,6 @@
 """dem_player 0.22.5 — PySide6 UI. Playback via audio.AudioEngine"""
 import sys
 import os
-import html
 import shutil
 import re
 import traceback
@@ -324,15 +323,7 @@ class AboutDialog(QDialog):
 
         self.text = QTextEdit()
         self.text.setReadOnly(True)
-        escaped = html.escape(info_text)
-        url = "https://github.com/999jjkl/dem_player"
-        escaped = escaped.replace(
-            url,
-            f'<a href="{url}">{url}</a>',
-        )
-        self.text.setHtml(f"<pre>{escaped}</pre>")
-        self.text.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        self.text.setOpenExternalLinks(True)
+        self.text.setPlainText(info_text)
         if font is not None:
             self.text.setFont(font)
         self.text.setStyleSheet(
