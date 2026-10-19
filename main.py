@@ -893,7 +893,15 @@ class MusicRoom(QMainWindow):
     def update_volume_to_actual(self):
         vol = self.volume_text.value()
         self.audio_engine.set_volume(vol)
+
+    def _window_drag_blocked(self):
+        return self.window_mode == 1 or self.isFullScreen() or self.isMaximized()
+
     def mousePressEvent(self, event):
+        if self._window_drag_blocked():
+            self._drag_started = False
+            super().mousePressEvent(event)
+            return
         if event.position().y() < 40 and event.button() == Qt.MouseButton.LeftButton:
             self._drag_press_pos = event.globalPosition().toPoint()
             self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -903,6 +911,16 @@ class MusicRoom(QMainWindow):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._window_drag_blocked():
+            if self.drag_frame is not None:
+                self.drag_frame.hide()
+            self._drag_started = False
+            if event.position().y() < 40:
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+            else:
+                self.setCursor(Qt.CursorShape.BlankCursor)
+            super().mouseMoveEvent(event)
+            return
         if self._drag_started and (event.buttons() & Qt.MouseButton.LeftButton):
             new_tl = event.globalPosition().toPoint() - self._drag_offset
             if self.drag_frame is not None:
@@ -930,6 +948,12 @@ class MusicRoom(QMainWindow):
             self.setCursor(Qt.CursorShape.BlankCursor)
 
     def mouseReleaseEvent(self, event):
+        if self._window_drag_blocked():
+            if self.drag_frame is not None:
+                self.drag_frame.hide()
+            self._drag_started = False
+            super().mouseReleaseEvent(event)
+            return
         if self._drag_started and self.drag_frame is not None:
             target = self.drag_frame.pos()
             self.drag_frame.hide()
