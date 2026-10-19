@@ -10,7 +10,7 @@ import re
 import sys
 import time
 
-APP_VERSION = "0.22.5"
+APP_VERSION = "0.22.6"
 
 TIME_FORMAT_MM_SS = "mm_ss"
 TIME_FORMAT_MM_SS_CC = "mm_ss_cc"
