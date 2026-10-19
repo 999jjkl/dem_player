@@ -10,7 +10,7 @@ import re
 import sys
 import time
 
-APP_VERSION = "0.22.3"
+APP_VERSION = "0.22.5"
 
 TIME_FORMAT_MM_SS = "mm_ss"
 TIME_FORMAT_MM_SS_CC = "mm_ss_cc"
@@ -179,6 +179,7 @@ _OPEN_WITH_EXTS = (
     "mid", "midi", "rmi", "kar",
     "mod", "xm", "it", "s3m", "mptm", "mpt", "mt2", "stm",
     "ftm", "dnm", "sap", "sid", "tm8", "vgm", "vgz",
+    "m3u", "m3u8",
 )
 
 
@@ -358,25 +359,40 @@ def subprocess_create_no_window() -> int:
 
 # ---------- M3U ----------
 def parse_m3u(m3u_path: str) -> list:
+    """Local files and stream URLs (http/https/mms/rtmp/rtsp), including UTF-16 playlists."""
     items = []
     if not os.path.isfile(m3u_path):
         return items
     base_dir = os.path.dirname(os.path.abspath(m3u_path))
     try:
-        with open(m3u_path, "r", encoding="utf-8-sig", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                low = line.lower()
-                if low.startswith("http://") or low.startswith("https://"):
-                    items.append(line)
-                else:
-                    full = line if os.path.isabs(line) else os.path.join(base_dir, line)
-                    if os.path.isfile(full):
-                        items.append(full)
+        with open(m3u_path, "rb") as f:
+            raw = f.read()
     except Exception as e:
         log(f"[M3U] {m3u_path}: {e}", 30)
+        return items
+    text = ""
+    if raw.startswith(b"\xff\xfe") or raw.startswith(b"\xfe\xff"):
+        text = raw.decode("utf-16", errors="ignore")
+    else:
+        for enc in ("utf-8-sig", "utf-8", "gbk", "big5", "latin-1"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+    schemes = ("http://", "https://", "mms://", "mmsh://", "rtmp://", "rtmps://", "rtsp://")
+    for line in text.splitlines():
+        line = line.strip().strip('"').strip("'")
+        if not line or line.startswith("#"):
+            continue
+        low = line.lower()
+        if low.startswith(schemes):
+            items.append(line)
+            continue
+        full = line if os.path.isabs(line) else os.path.join(base_dir, line)
+        if os.path.isfile(full):
+            items.append(full)
+    log(f"[M3U] {m3u_path} entries={len(items)}", 20)
     return items
 
 
