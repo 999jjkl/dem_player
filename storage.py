@@ -71,6 +71,7 @@ DEFAULT_SETTINGS = {
     "output_device": "",
     "show_advanced_audio": False,
     "engine_mode": "auto",
+    "custom_themes": [],
 }
 
 
@@ -151,7 +152,39 @@ def load_settings():
     except (TypeError, ValueError):
         data["aero_opacity"] = 40
     data["allow_screensaver"] = bool(data.get("allow_screensaver", False))
+    data["custom_themes"] = _clean_custom_themes(data.get("custom_themes"))
     return data
+
+
+def _clean_custom_themes(raw):
+    out = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()[:32]
+        bg = _norm_hex(item.get("bg"))
+        accent = _norm_hex(item.get("accent"))
+        if not name or not bg or not accent:
+            continue
+        out.append({"name": name, "bg": bg, "accent": accent})
+        if len(out) >= 24:
+            break
+    return out
+
+
+def _norm_hex(value):
+    s = str(value or "").strip()
+    if not s.startswith("#"):
+        s = "#" + s
+    if len(s) == 7 and all(ch in "0123456789abcdefABCDEF" for ch in s[1:]):
+        return s.upper()
+    return ""
+
+
+def _hex6(value):
+    return bool(_norm_hex(value))
 
 
 def save_settings(settings):
