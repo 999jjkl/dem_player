@@ -295,30 +295,78 @@ def _cleanup_file(path: str | None) -> None:
         pass
 
 
-def _ffmpeg_decode_to_wav(filepath: str) -> str | None:
+_FFMPEG_LAST_ERROR = ""
+
+
+def ffmpeg_last_error() -> str:
+    return _FFMPEG_LAST_ERROR
+
+
+def _ffmpeg_decode_to_wav(filepath: str, cancel=None) -> str | None:
+    """Decode a local file to a temp WAV. cancel() True kills ffmpeg (UI stays free)."""
+    global _FFMPEG_LAST_ERROR
+    _FFMPEG_LAST_ERROR = ""
+    exe = _ffmpeg_bin()
+    if not exe or (not os.path.isfile(exe) and not shutil_which(exe)):
+        _FFMPEG_LAST_ERROR = "Need ffmpeg.exe next to the player for this format"
+        log(f"[ffmpeg] {_FFMPEG_LAST_ERROR}", 40)
+        return None
+    fd, tmp = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    cmd = [
+        exe, "-y", "-nostdin", "-i", filepath,
+        "-f", "wav", "-acodec", "pcm_s16le",
+        "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS), tmp,
+    ]
     try:
-        fd, tmp = tempfile.mkstemp(suffix=".wav")
-        os.close(fd)
-        cmd = [
-            _ffmpeg_bin(), "-y", "-nostdin", "-i", filepath,
-            "-f", "wav", "-acodec", "pcm_s16le",
-            "-ar", str(SAMPLE_RATE), "-ac", str(CHANNELS), tmp,
-        ]
-        r = subprocess.run(
+        proc = subprocess.Popen(
             cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             **subprocess_hidden_kwargs(),
         )
-        if r.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) < 128:
-            err = (r.stderr or b"")[-400:].decode("utf-8", "ignore")
-            log(f"[ffmpeg] decode failed rc={r.returncode} {err}", 30)
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
+    except Exception as e:
+        _FFMPEG_LAST_ERROR = f"ffmpeg failed to start: {e}"
+        log(f"[ffmpeg] {_FFMPEG_LAST_ERROR}", 40)
+        _cleanup_file(tmp)
+        return None
+    try:
+        while proc.poll() is None:
+            if cancel is not None and cancel():
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+                _FFMPEG_LAST_ERROR = "cancelled"
+                log(f"[ffmpeg] decode cancelled {filepath}", 30)
+                _cleanup_file(tmp)
+                return None
+            time.sleep(0.05)
+        err = b""
+        try:
+            err = (proc.stderr.read() if proc.stderr else b"")[-400:]
+        except Exception:
+            pass
+        if proc.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) < 128:
+            detail = err.decode("utf-8", "ignore").strip().splitlines()
+            tail = detail[-1] if detail else ""
+            _FFMPEG_LAST_ERROR = "Cannot decode (file damaged or unsupported)"
+            if tail:
+                _FFMPEG_LAST_ERROR += f": {tail[:160]}"
+            log(f"[ffmpeg] decode failed rc={proc.returncode} {tail}", 40)
+            _cleanup_file(tmp)
             return None
         return tmp
     except Exception as e:
-        log(f"[ffmpeg] {e}", 40)
+        _FFMPEG_LAST_ERROR = f"ffmpeg decode error: {e}"
+        log(f"[ffmpeg] {_FFMPEG_LAST_ERROR}", 40)
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        _cleanup_file(tmp)
         return None
 
 
@@ -1178,7 +1226,7 @@ class FFmpegBackend(MiniaudioBackend):
     def _decode_to_wav(self, filepath):
         wav = _ffmpeg_decode_to_wav(filepath)
         if not wav:
-            self.last_error = "ffmpeg cannot decode this file (is ffmpeg.exe next to the player?)"
+            self.last_error = ffmpeg_last_error() or "ffmpeg cannot decode this file (is ffmpeg.exe next to the player?)"
         return wav
 
 
