@@ -211,6 +211,51 @@ ENGINE_MAP = {
 }
 
 
+class FfmpegDecodeThread(QThread):
+    """Local M4A/AAC/WMA/… → WAV off the UI thread. Interruption kills ffmpeg."""
+    decoded = Signal(str)
+
+    def __init__(self, filepath):
+        super().__init__()
+        self.filepath = filepath
+
+    def run(self):
+        from audio import _ffmpeg_decode_to_wav
+        wav = ""
+        if not (hasattr(self, "isInterruptionRequested") and self.isInterruptionRequested()):
+            wav = _ffmpeg_decode_to_wav(self.filepath, cancel=self.isInterruptionRequested) or ""
+        if not (hasattr(self, "isInterruptionRequested") and self.isInterruptionRequested()):
+            self.decoded.emit(wav)
+
+
+class DurationScanThread(QThread):
+    """F10: read durations off the UI thread. One signal per file."""
+    progress = Signal(int, int, str, int)
+    done = Signal(int, int)
+
+    def __init__(self, paths):
+        super().__init__()
+        self.paths = list(paths)
+
+    def run(self):
+        from core import probe_file_duration_ms
+        ok = 0
+        total = len(self.paths)
+        for i, path in enumerate(self.paths, 1):
+            if hasattr(self, "isInterruptionRequested") and self.isInterruptionRequested():
+                self.done.emit(ok, total)
+                return
+            ms = 0
+            try:
+                ms = int(probe_file_duration_ms(path) or 0)
+            except Exception:
+                ms = 0
+            if ms > 0:
+                ok += 1
+            self.progress.emit(i, total, path, ms)
+        self.done.emit(ok, total)
+
+
 class ConversionThread(QThread):
     finished = Signal(str)
 
