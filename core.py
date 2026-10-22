@@ -10,7 +10,7 @@ import re
 import sys
 import time
 
-APP_VERSION = "0.22.6"
+APP_VERSION = "0.22.8"
 
 TIME_FORMAT_MM_SS = "mm_ss"
 TIME_FORMAT_MM_SS_CC = "mm_ss_cc"
@@ -393,7 +393,23 @@ def parse_m3u(m3u_path: str) -> list:
         if os.path.isfile(full):
             items.append(full)
     log(f"[M3U] {m3u_path} entries={len(items)}", 20)
+    if not items:
+        log(f"[M3U] no playable entries in {m3u_path}", 30)
     return items
+
+
+def write_m3u(dest: str, entries: list) -> None:
+    """Write a playlist. entries are local paths or stream URLs."""
+    lines = ["#EXTM3U"]
+    for item in entries or []:
+        item = str(item or "").strip()
+        if not item:
+            continue
+        name = item.rstrip("/\\").split("/")[-1].split("\\")[-1] or item
+        lines.append(f"#EXTINF:-1,{name}")
+        lines.append(item)
+    with open(dest, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 # ---------- CUE ----------
