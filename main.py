@@ -1,4 +1,4 @@
-"""dem_player 0.22.5 — PySide6 UI. Playback via audio.AudioEngine"""
+"""dem_player 0.22.8 — PySide6 UI. Playback via audio.AudioEngine."""
 import sys
 import os
 import shutil
@@ -26,7 +26,7 @@ from core import (
     APP_VERSION, TIME_FORMAT_MM_SS, TIME_FORMAT_MM_SS_CC,
     app_dir, data_path, resource_path, logs_dir,
     init_log, log, close_log,
-    parse_cue_file, parse_m3u, read_metadata as core_read_metadata,
+    parse_cue_file, parse_m3u, write_m3u, read_metadata as core_read_metadata,
     prevent_sleep, apply_cpu_affinity, apply_window_blur, HAS_MUTAGEN,
     probe_file_duration_ms, same_path, register_open_with,
 )
@@ -40,10 +40,14 @@ from storage import (
     migrate_old_files_if_needed,
 )
 from audio import (
-    AudioEngine, list_output_devices, HAS_MINIAUDIO,
+    AudioEngine, list_output_devices, HAS_MINIAUDIO, FFMPEG_EXT,
     probe_ffmpeg, probe_openmpt, probe_fluidsynth, probe_soundfont,
+    ffmpeg_last_error,
 )
-from converters import ConversionThread, FurnaceConverter, AsapConverter, ZxtuneConverter
+from converters import (
+    ConversionThread, FfmpegDecodeThread, DurationScanThread,
+    FurnaceConverter, AsapConverter, ZxtuneConverter,
+)
 
 # numpy / sounddevice are heavy. Import them the first time audio-level needs them.
 _np = None
@@ -608,6 +612,7 @@ class MusicRoom(QMainWindow):
             self.time_format = TIME_FORMAT_MM_SS_CC
 
         self.output_device = settings.get("output_device", "") or ""
+        self.custom_themes = list(settings.get("custom_themes") or [])
         self.show_advanced_audio = False
         self.engine_mode = "auto"
 
@@ -622,10 +627,11 @@ class MusicRoom(QMainWindow):
         log(f"Sources: {len(self.source_paths)} paths, Favorites: {len(self.favorites)} lists", 20)
         log(f"History: {len(self.history_paths)} entries, {len(self.play_counts)} play counts", 20)
 
-        if self.current_theme_index < 0 or self.current_theme_index >= len(self.THEMES):
+        themes = self.all_themes()
+        if self.current_theme_index < 0 or self.current_theme_index >= len(themes):
             self.current_theme_index = 0
-        self.bg_color = self.THEMES[self.current_theme_index][1]
-        self.accent_color = self.THEMES[self.current_theme_index][2]
+        self.bg_color = themes[self.current_theme_index][1]
+        self.accent_color = themes[self.current_theme_index][2]
 
         if self.is_always_on_top:
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
@@ -669,6 +675,10 @@ class MusicRoom(QMainWindow):
         self.current_engine = 'miniaudio'
         self.temp_wav = None
         self.conv_thread = None
+        self._decode_thread = None
+        self._scan_thread = None
+        self._orphan_threads = []
+        self._expect_stream = None
         self.spectrum_source_path = None
 
         self.convert_cache = OrderedDict()
@@ -682,6 +692,8 @@ class MusicRoom(QMainWindow):
         self.loop_mode_names = ["OFF", "SINGLE", "LIST", "RANDOM"]
 
         self.show_settings = False
+        self._bios_page = 0
+        self._bios_kind = ""
         self.left_visible = True
 
         self.sd_stream = None
@@ -718,7 +730,7 @@ class MusicRoom(QMainWindow):
 
         self.setMouseTracking(True)
         self.file_list.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.settings_list.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.settings_list.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.search_input.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.progress_text.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.volume_text.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -855,6 +867,7 @@ class MusicRoom(QMainWindow):
             "time_format": self.time_format,
             "output_device": getattr(self, "output_device", ""),
             "engine_mode": "auto",
+            "custom_themes": list(getattr(self, "custom_themes", []) or []),
         }
     def _save_settings(self):
         save_settings(self._current_settings_dict())
@@ -1134,6 +1147,7 @@ class MusicRoom(QMainWindow):
         main_layout.addLayout(right_outer_layout, 1)
 
         self.left_stack.setCurrentIndex(0)
+        self._build_bios_overlay()
         self.apply_background_image()
 
     def paintEvent(self, event):
@@ -1224,119 +1238,301 @@ class MusicRoom(QMainWindow):
         QTimer.singleShot(0, self._apply_aero_blur)
         QTimer.singleShot(250, self._apply_aero_blur)
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if getattr(self, "bios_root", None) is not None and self.bios_root.isVisible():
+            self._place_bios()
+
     # ================== SETTINGS UI ==================
 
-    def update_settings_list(self):
-        self.settings_list.clear()
-        top_state = "Y" if self.is_always_on_top else "N"
-        self.settings_list.addItem(f"Always on Top                        [{top_state}]")
-        saver = "Y" if getattr(self, "allow_screensaver", False) else "N"
-        self.settings_list.addItem(f"Allow Screensaver While Playing      [{saver}]")
-        style_name = self.THEMES[self.current_theme_index][0]
-        self.settings_list.addItem(f"Style                                [{style_name}]")
-        level_state = "Y" if self.show_audio_level else "N"
-        self.settings_list.addItem(f"Audio Level                          [{level_state}]")
-        self.settings_list.addItem(f"Audio Level Source                   [{self.audio_level_source}]")
-        self.settings_list.addItem(f"Audio Level Mode                     [{self.audio_level_mode}]")
-        main_label = self._main_output_device_label()
-        self.settings_list.addItem(f"Output Device                        [{main_label}]")
-        count_state = "Y" if self.show_play_counts else "N"
-        self.settings_list.addItem(f"Show Play Counts                     [{count_state}]")
-        self.settings_list.addItem("Background Image...")
-        self.settings_list.addItem("Clear Background Image")
-        _bg_state = self.background_mode
-        if (self.background_mode in ("image",) and self._resolved_custom_bg()):
-            _bg_state = "image (custom)"
-        self.settings_list.addItem(f"Background                           [{_bg_state}]")
-        self.settings_list.addItem(f"Aero Opacity                         [{getattr(self, 'aero_opacity', 40)}%]")
-        log_state = "Y" if core_mod.LOG_ENABLED else "N"
-        self.settings_list.addItem(f"Log Save                             [{log_state}]")
-        dur_state = "Y" if self.show_duration else "N"
-        self.settings_list.addItem(f"Show Duration                        [{dur_state}]")
-        cover_state = "Y" if self.show_cover_art else "N"
-        self.settings_list.addItem(f"Show Cover Art                       [{cover_state}]")
+    def all_themes(self):
+        rows = list(self.THEMES)
+        for t in self.custom_themes or []:
+            rows.append((t["name"], t["bg"], t["accent"]))
+        return rows
+
+    def _theme_tuple(self, index=None):
+        themes = self.all_themes()
+        if index is None:
+            index = self.current_theme_index
+        if index < 0 or index >= len(themes):
+            index = 0
+        return themes[index]
+
+    def _build_bios_overlay(self):
+        self.bios_root = QFrame(self)
+        self.bios_root.setObjectName("BiosRoot")
+        self.bios_root.hide()
+        lay = QVBoxLayout(self.bios_root)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(6)
+        self.bios_title = QLabel("SETTING")
+        self.bios_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.bios_page_label = QLabel("")
+        self.bios_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.bios_title)
+        lay.addWidget(self.bios_page_label)
+        self.settings_list.setParent(self.bios_root)
+        self.settings_list.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.settings_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        lay.addWidget(self.settings_list, 1)
+        self.bios_hint = QLabel("←/→ Page    ↑/↓ Move    Enter Edit    Esc Back")
+        self.bios_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self.bios_hint)
+
+        self.bios_editor = QFrame(self.bios_root)
+        self.bios_editor.setObjectName("BiosEditor")
+        self.bios_editor.hide()
+        el = QVBoxLayout(self.bios_editor)
+        el.setContentsMargins(10, 8, 10, 8)
+        self.bios_editor_title = QLabel("")
+        self.bios_editor_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        el.addWidget(self.bios_editor_title)
+        self.bios_editor_list = QListWidget()
+        self.bios_editor_list.setFont(self.dos_font)
+        self.bios_editor_list.itemActivated.connect(self._on_bios_choice)
+        el.addWidget(self.bios_editor_list, 1)
+        self.bios_text = QTextEdit()
+        self.bios_text.setReadOnly(True)
+        self.bios_text.setFont(self.dos_font)
+        self.bios_text.hide()
+        el.addWidget(self.bios_text, 1)
+        self.bios_form = QWidget()
+        form = QVBoxLayout(self.bios_form)
+        form.setContentsMargins(0, 0, 0, 0)
+        self.theme_name = QLineEdit()
+        self.theme_bg = QLineEdit()
+        self.theme_accent = QLineEdit()
+        self.theme_name.setPlaceholderText("Name")
+        self.theme_bg.setPlaceholderText("Background #RRGGBB")
+        self.theme_accent.setPlaceholderText("Accent #RRGGBB")
+        for w in (self.theme_name, self.theme_bg, self.theme_accent):
+            w.setFont(self.dos_font)
+            w.installEventFilter(self)
+            form.addWidget(w)
+        self.bios_save_btn = QPushButton("Save Theme")
+        self.bios_cancel_btn = QPushButton("Cancel")
+        self.bios_save_btn.setFont(self.dos_font)
+        self.bios_cancel_btn.setFont(self.dos_font)
+        self.bios_save_btn.clicked.connect(self._save_custom_theme)
+        self.bios_cancel_btn.clicked.connect(self._close_bios_editor)
+        form.addWidget(self.bios_save_btn)
+        form.addWidget(self.bios_cancel_btn)
+        self.bios_form.hide()
+        el.addWidget(self.bios_form)
+        self.bios_editor_hint = QLabel("Enter apply    Esc back")
+        self.bios_editor_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        el.addWidget(self.bios_editor_hint)
+        self.settings_list.installEventFilter(self)
+        self.bios_editor_list.installEventFilter(self)
+
+    def _style_bios(self):
+        if getattr(self, "bios_root", None) is None:
+            return
+        c = self.accent_color
+        bg = "#000000"
+        sheet = (
+            f"QFrame#BiosRoot {{ background-color: {bg}; color: {c}; border: 2px solid {c}; }}"
+            f"QFrame#BiosEditor {{ background-color: {bg}; color: {c}; border: 2px solid {c}; }}"
+            f"QFrame#BiosRoot QWidget {{ background-color: {bg}; color: {c}; }}"
+            f"QFrame#BiosRoot QListWidget {{ background-color: {bg}; color: {c}; border: 1px solid {c}; }}"
+            f"QFrame#BiosRoot QListWidget::item:selected {{ background-color: {c}; color: {bg}; }}"
+            f"QFrame#BiosRoot QLineEdit {{ background-color: {bg}; color: {c}; border: 1px solid {c}; }}"
+            f"QFrame#BiosRoot QPushButton {{ background-color: {bg}; color: {c}; border: 1px solid {c}; }}"
+            f"QFrame#BiosRoot QLabel {{ background-color: transparent; color: {c}; }}"
+            f"QFrame#BiosRoot QTextEdit {{ background-color: {bg}; color: {c}; border: 1px solid {c}; }}"
+        )
+        self.bios_root.setStyleSheet(sheet)
+        for w in (self.bios_title, self.bios_page_label, self.bios_hint,
+                  self.bios_editor_title, self.bios_editor_hint,
+                  self.settings_list, self.bios_editor_list, self.bios_text):
+            w.setFont(self.dos_font)
+
+    def _place_bios(self):
+        if getattr(self, "bios_root", None) is None:
+            return
+        self.bios_root.setGeometry(self.rect().adjusted(8, 8, -8, -8))
+        if self.bios_editor.isVisible():
+            self._place_bios_editor()
+
+    def _place_bios_editor(self):
+        host = self.bios_root
+        w = min(560, max(280, host.width() - 80))
+        h = min(420, max(220, host.height() - 80))
+        self.bios_editor.setGeometry((host.width() - w) // 2, (host.height() - h) // 2, w, h)
+        self.bios_editor.raise_()
+
+    def _close_bios_editor(self):
+        if getattr(self, "bios_editor", None) is None:
+            return
+        self.bios_editor.hide()
+        self.bios_form.hide()
+        self.bios_text.hide()
+        self.bios_editor_list.show()
+        self._bios_kind = ""
+        if self.show_settings:
+            self.settings_list.setFocus()
+
+    def _shift_bios_page(self, delta):
+        pages = self._bios_pages()
+        if not pages:
+            return
+        self._bios_page = (self._bios_page + delta) % len(pages)
+        self._close_bios_editor()
+        self.update_settings_list()
+
+    def _settings_key(self, key):
+        if key == Qt.Key.Key_Escape:
+            if self.bios_editor.isVisible():
+                self._close_bios_editor()
+            else:
+                self.toggle_settings_page()
+            return True
+        if self.bios_editor.isVisible():
+            if key in (Qt.Key.Key_Left, Qt.Key.Key_Right):
+                return True
+            return False
+        if key == Qt.Key.Key_Left:
+            self._shift_bios_page(-1)
+            return True
+        if key == Qt.Key.Key_Right:
+            self._shift_bios_page(1)
+            return True
+        return False
+
+    def eventFilter(self, obj, event):
+        if self.show_settings and event.type() == QEvent.Type.KeyPress:
+            key = event.key()
+            if obj in (getattr(self, "theme_name", None), getattr(self, "theme_bg", None), getattr(self, "theme_accent", None)):
+                if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    self._save_custom_theme()
+                    return True
+                if key == Qt.Key.Key_Escape:
+                    self._close_bios_editor()
+                    return True
+            if obj is self.settings_list and not self.bios_editor.isVisible():
+                if key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Escape):
+                    self._settings_key(key)
+                    return True
+            if obj is self.bios_editor_list and key == Qt.Key.Key_Escape:
+                self._close_bios_editor()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _bios_pages(self):
+        yn = lambda v: "Y" if v else "N"
+        theme_name = self._theme_tuple()[0]
         time_label = "MM:SS.CC" if self.time_format == TIME_FORMAT_MM_SS_CC else "MM:SS"
-        self.settings_list.addItem(f"Time Format                          [{time_label}]")
-        self.settings_list.addItem("--- Music Folders ---")
-        for i, p in enumerate(self.source_paths):
-            self.settings_list.addItem(f"Remove Folder                        [{i}] {p}")
-        self.settings_list.addItem("Add Music Folder...")
-        self.settings_list.addItem("Refresh File List")
-        self.settings_list.addItem("Register Open With...")
-        self.settings_list.addItem("Scan This Folder Durations (F10)")
-        self.settings_list.addItem("--- Maintenance ---")
-        self.settings_list.addItem("Clear History")
-        self.settings_list.addItem("Clear Play Counts")
-        self.settings_list.addItem("Clear Favorites")
-        self.settings_list.addItem("Clear Duration Cache")
-        self.settings_list.addItem("Reset All Settings")
-        self.settings_list.addItem("--- About ---")
-        self.settings_list.addItem(f"About dem_player {APP_VERSION}")
+        bg_state = self.background_mode
+        if self.background_mode == "image" and self._resolved_custom_bg():
+            bg_state = "image (custom)"
+        library = [("folder_add", "Add Music Folder", "")]
+        for i, path in enumerate(self.source_paths):
+            library.append((f"folder_remove:{i}", "Remove Folder", path))
+        library.append(("refresh", "Refresh File List", ""))
+        library.append(("scan", "Scan This Folder Durations", "F10"))
+        return [
+            ("General", [
+                ("always_on_top", "Always on Top", yn(self.is_always_on_top)),
+                ("screensaver", "Allow Screensaver While Playing", yn(self.allow_screensaver)),
+                ("themes", "Themes", theme_name),
+                ("time_format", "Time Format", time_label),
+            ]),
+            ("Audio", [
+                ("output", "Output Device", self._main_output_device_label()),
+                ("audio_level", "Audio Level", yn(self.show_audio_level)),
+                ("audio_source", "Audio Level Source", self.audio_level_source),
+                ("audio_mode", "Audio Level Mode", self.audio_level_mode),
+            ]),
+            ("Display", [
+                ("background", "Background", bg_state),
+                ("aero", "Aero Opacity", f"{getattr(self, 'aero_opacity', 40)}%"),
+                ("bg_image", "Background Image", "pick"),
+                ("bg_clear", "Clear Background Image", ""),
+                ("duration", "Show Duration", yn(self.show_duration)),
+                ("cover", "Show Cover Art", yn(self.show_cover_art)),
+                ("counts", "Show Play Counts", yn(self.show_play_counts)),
+            ]),
+            ("Library", library),
+            ("System", [
+                ("log", "Log Save", yn(core_mod.LOG_ENABLED)),
+                ("openwith", "Register Open With", ""),
+                ("clear_history", "Clear History", ""),
+                ("clear_counts", "Clear Play Counts", ""),
+                ("clear_favs", "Clear Favorites", ""),
+                ("clear_cache", "Clear Duration Cache", ""),
+                ("reset", "Reset All Settings", ""),
+                ("about", "About", APP_VERSION),
+            ]),
+        ]
+
+    def update_settings_list(self):
+        if getattr(self, "bios_root", None) is None:
+            return
+        pages = self._bios_pages()
+        if self._bios_page < 0 or self._bios_page >= len(pages):
+            self._bios_page = 0
+        title, rows = pages[self._bios_page]
+        self.bios_page_label.setText(f"←  {title}  →     {self._bios_page + 1}/{len(pages)}")
+        row = self.settings_list.currentRow()
+        self.settings_list.clear()
+        for sid, label, value in rows:
+            if value:
+                text = f"{label:<34} [{value}]"
+            else:
+                text = label
+            item = QListWidgetItem(text)
+            item.setData(Qt.ItemDataRole.UserRole, sid)
+            self.settings_list.addItem(item)
+        if self.settings_list.count():
+            self.settings_list.setCurrentRow(max(0, min(row, self.settings_list.count() - 1)))
+
     def on_setting_selected(self, item):
-        text = item.text()
-        if text.startswith("Always on Top"):
-            self.toggle_always_on_top()
-        elif text.startswith("Allow Screensaver"):
-            self.allow_screensaver = not self.allow_screensaver
-            self._set_keep_awake(self.audio_engine.is_playing())
-            self._save_settings()
-            self.track_status.setText(
-                "Screensaver allowed while playing" if self.allow_screensaver
-                else "Screensaver blocked while playing")
-        elif text.startswith("Style"):
-            self.cycle_theme()
-        elif text.startswith("Audio Level Source"):
-            self.toggle_audio_level_source()
-        elif text.startswith("Audio Level Mode"):
-            self.toggle_audio_level_mode()
-        elif text.startswith("Audio Level"):
-            self.toggle_audio_level_display()
-        elif "Output Device" in text:
-            self.pick_main_device()
-        elif text.startswith("Show Play Counts"):
-            self.toggle_show_play_counts()
-        elif text.startswith("Background Image..."):
+        sid = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(sid, str) or not sid:
+            return
+        self._edit_setting(sid)
+
+    def _edit_setting(self, sid):
+        if sid == "always_on_top":
+            self._open_choice("Always on Top", "always_on_top", [("No", False), ("Yes", True)], self.is_always_on_top)
+        elif sid == "screensaver":
+            self._open_choice("Screensaver While Playing", "screensaver", [("No", False), ("Yes", True)], self.allow_screensaver)
+        elif sid == "themes":
+            self._open_theme_choices()
+        elif sid == "time_format":
+            self._open_choice("Time Format", "time_format", [("MM:SS", TIME_FORMAT_MM_SS), ("MM:SS.CC", TIME_FORMAT_MM_SS_CC)], self.time_format)
+        elif sid == "output":
+            rows = [("System Default", "")]
+            for did, name in list_output_devices():
+                rows.append((str(name), did))
+            self._open_choice("Output Device", "output", rows, self.output_device or "")
+        elif sid == "audio_level":
+            self._open_choice("Audio Level", "audio_level", [("Off", False), ("On", True)], self.show_audio_level)
+        elif sid == "audio_source":
+            self._open_choice("Audio Level Source", "audio_source", [("file", "file"), ("system", "system")], self.audio_level_source)
+        elif sid == "audio_mode":
+            self._open_choice("Audio Level Mode", "audio_mode", [("all", "all"), ("volume", "volume")], self.audio_level_mode)
+        elif sid == "background":
+            self._open_choice("Background", "background", [
+                ("transparent", "transparent"), ("aero", "aero"), ("solid", "solid"), ("image", "image"),
+            ], self.background_mode)
+        elif sid == "aero":
+            cur = int(getattr(self, "aero_opacity", 40))
+            rows = [(f"{n}%", n) for n in range(0, 101, 10)]
+            self._open_choice("Aero Opacity", "aero", rows, cur)
+        elif sid == "bg_image":
             self.pick_background_image()
-        elif text.startswith("Clear Background Image"):
-            self.clear_background_image()
-        elif text.startswith("Background"):
-            self.cycle_background_mode()
-        elif text.startswith("Aero Opacity"):
-            self.cycle_aero_opacity()
-        elif text.startswith("Log Save"):
-            self.toggle_log_enabled()
-        elif text.startswith("Show Duration"):
-            self.show_duration = not self.show_duration
-            self._save_settings()
-            if self.current_dir:
-                self.refresh_current_directory()
-        elif text.startswith("Show Cover Art"):
-            self.show_cover_art = not self.show_cover_art
-            self._save_settings()
-            self.load_cover_art(self.current_file_path)
-        elif text.startswith("Time Format"):
-            self.toggle_time_format()
-        elif text.startswith("Remove Folder"):
-            m = re.search(r"\[(\d+)\]", text)
-            if m:
-                idx = int(m.group(1))
-                if 0 <= idx < len(self.source_paths):
-                    removed = self.source_paths[idx]
-                    reply = QMessageBox.question(
-                        self,
-                        "Confirm Removal",
-                        f"Remove this music folder from the list?\n\n{removed}\n\n"
-                        f"(Removed from the list only. Files on disk are NOT deleted.)",
-                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                        QMessageBox.StandardButton.No
-                    )
-                    if reply != QMessageBox.StandardButton.Yes:
-                        return
-                    self.source_paths.pop(idx)
-                    self._save_playlist()
-                    self.track_status.setText(f"Removed: {removed}")
-                    log(f"[Settings] Removed source folder: {removed}", 20)
-        elif text.startswith("Add Music Folder"):
+            self.update_settings_list()
+        elif sid == "bg_clear":
+            self._open_choice("Clear Background Image", "bg_clear", [("No", False), ("Yes", True)], False)
+        elif sid == "duration":
+            self._open_choice("Show Duration", "duration", [("No", False), ("Yes", True)], self.show_duration)
+        elif sid == "cover":
+            self._open_choice("Show Cover Art", "cover", [("No", False), ("Yes", True)], self.show_cover_art)
+        elif sid == "counts":
+            self._open_choice("Show Play Counts", "counts", [("No", False), ("Yes", True)], self.show_play_counts)
+        elif sid == "folder_add":
             folder = QFileDialog.getExistingDirectory(self, "Select music folder")
             if folder:
                 if folder not in self.source_paths:
@@ -1346,83 +1542,295 @@ class MusicRoom(QMainWindow):
                     log(f"[Settings] Added folder: {folder}", 20)
                 else:
                     self.track_status.setText("Folder already in list")
-        elif text.startswith("Refresh File List"):
+            self.update_settings_list()
+        elif sid.startswith("folder_remove:"):
+            try:
+                idx = int(sid.split(":", 1)[1])
+            except ValueError:
+                return
+            if 0 <= idx < len(self.source_paths):
+                self._open_choice("Remove Folder", sid, [("No", False), ("Yes", True)], False)
+        elif sid == "refresh":
             self.refresh_current_directory()
-        elif text.startswith("Register Open With"):
-            self.register_open_with_dialog()
-        elif text.startswith("Scan This Folder Durations"):
+            self.track_status.setText("File list refreshed")
+        elif sid == "scan":
+            self.toggle_settings_page()
             self.start_duration_scan()
-        elif text.startswith("Clear History"):
-            reply = QMessageBox.question(self, "Confirm", "Clear all play history?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                self.history_paths = []
-                self._save_history()
-                self.track_status.setText("History cleared")
-                log("[Settings] History cleared", 20)
-        elif text.startswith("Clear Play Counts"):
-            reply = QMessageBox.question(self, "Confirm", "Clear all play counts?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                self.play_counts = {}
-                self._save_history()
-                self.track_status.setText("Play counts cleared")
-                log("[Settings] Play counts cleared", 20)
-        elif text.startswith("Clear Favorites"):
-            reply = QMessageBox.question(self, "Confirm", "Clear all favorites lists?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                self.favorites = {}
-                self._save_playlist()
-                self.track_status.setText("Favorites cleared")
-                log("[Settings] Favorites cleared", 20)
-        elif text.startswith("Clear Duration Cache"):
-            reply = QMessageBox.question(self, "Confirm",
-                "Clear duration cache? Duration labels will be re-scanned.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                self.folder_cache.clear()
-                self._mark_cache_dirty()
-                self._write_cache()
-                if self.current_dir:
-                    self.refresh_current_directory()
-                self.track_status.setText("Cache cleared")
-                log("[Settings] Duration cache cleared", 20)
-        elif text.startswith("Reset All Settings"):
-            reply = QMessageBox.question(self, "Confirm", "Reset all settings to default?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                self.current_theme_index = 0
-                self.show_play_counts = True
-                self.show_duration = True
-                self.audio_level_mode = "all"
-                self.show_cover_art = True
-                self.show_audio_level = False
-                self.audio_level_source = "file"
-                self.loop_mode = 0
-                self.background_mode = "aero"
-                self.aero_opacity = 40
-                self._remove_custom_bg_file()  # same as Clear Background Image
-                self.is_always_on_top = False
-                self.allow_screensaver = False
-                self.time_format = TIME_FORMAT_MM_SS_CC
-                self.output_device = ""
-                self.engine_mode = "auto"
-                self.bg_color = self.THEMES[0][1]
-                self.accent_color = self.THEMES[0][2]
-                self.volume_text.setValue(50)
+        elif sid == "log":
+            self._open_choice("Log Save", "log", [("No", False), ("Yes", True)], bool(core_mod.LOG_ENABLED))
+        elif sid == "openwith":
+            self._show_bios_text("Open With", self._register_open_with_text())
+        elif sid in ("clear_history", "clear_counts", "clear_favs", "clear_cache", "reset"):
+            titles = {
+                "clear_history": "Clear History",
+                "clear_counts": "Clear Play Counts",
+                "clear_favs": "Clear Favorites",
+                "clear_cache": "Clear Duration Cache",
+                "reset": "Reset All Settings",
+            }
+            self._open_choice(titles[sid], sid, [("No", False), ("Yes", True)], False)
+        elif sid == "about":
+            self._show_bios_text(f"About dem_player {APP_VERSION}", self._build_about_text())
+
+    def _open_choice(self, title, kind, rows, current):
+        self._bios_kind = kind
+        self.bios_form.hide()
+        self.bios_text.hide()
+        self.bios_editor_list.show()
+        self.bios_editor_title.setText(title)
+        self.bios_editor_hint.setText("↑/↓ Move    Enter apply    Esc back")
+        self.bios_editor_list.clear()
+        selected = 0
+        for i, (label, payload) in enumerate(rows):
+            item = QListWidgetItem(str(label))
+            item.setData(Qt.ItemDataRole.UserRole, payload)
+            self.bios_editor_list.addItem(item)
+            if payload == current:
+                selected = i
+        self.bios_editor.show()
+        self._place_bios_editor()
+        self.bios_editor_list.setCurrentRow(selected)
+        self.bios_editor_list.setFocus()
+
+    def _open_theme_choices(self):
+        rows = []
+        for i, (name, _bg, _ac) in enumerate(self.all_themes()):
+            tag = name if i < len(self.THEMES) else f"{name}  (custom)"
+            rows.append((tag, f"pick:{i}"))
+        rows.append(("Add Theme...", "add"))
+        for i, t in enumerate(self.custom_themes or []):
+            rows.append((f"Delete {t['name']}", f"del:{i}"))
+        self._open_choice("Themes", "themes", rows, f"pick:{self.current_theme_index}")
+
+    def _show_bios_text(self, title, text):
+        self._bios_kind = "text"
+        self.bios_form.hide()
+        self.bios_editor_list.hide()
+        self.bios_text.show()
+        self.bios_editor_title.setText(title)
+        self.bios_editor_hint.setText("Esc back")
+        self.bios_text.setPlainText(text or "")
+        self.bios_editor.show()
+        self._place_bios_editor()
+        self.bios_text.setFocus()
+
+    def _open_theme_form(self):
+        self._bios_kind = "theme_form"
+        self.bios_editor_list.hide()
+        self.bios_text.hide()
+        self.bios_form.show()
+        self.bios_editor_title.setText("Add Theme")
+        self.bios_editor_hint.setText("Enter save    Esc back")
+        self.theme_name.clear()
+        self.theme_bg.setText("#000000")
+        self.theme_accent.setText(self.accent_color if str(self.accent_color).startswith("#") else "#FFFFFF")
+        self.bios_editor.show()
+        self._place_bios_editor()
+        self.theme_name.setFocus()
+
+    def _save_custom_theme(self):
+        name = self.theme_name.text().strip()[:32]
+        bg = self.theme_bg.text().strip()
+        accent = self.theme_accent.text().strip()
+        if not name:
+            self.track_status.setText("Theme name is empty")
+            return
+        if not bg.startswith("#"):
+            bg = "#" + bg
+        if not accent.startswith("#"):
+            accent = "#" + accent
+        hexdigits = set("0123456789abcdefABCDEF")
+        if len(bg) != 7 or len(accent) != 7 or any(ch not in hexdigits for ch in bg[1:] + accent[1:]):
+            self.track_status.setText("Color must be #RRGGBB")
+            return
+        self.custom_themes.append({"name": name, "bg": bg.upper(), "accent": accent.upper()})
+        self.custom_themes = self.custom_themes[:24]
+        self.current_theme_index = len(self.THEMES) + len(self.custom_themes) - 1
+        picked = self._theme_tuple()
+        self.bg_color = picked[1]
+        self.accent_color = picked[2]
+        self.apply_theme()
+        self._save_settings()
+        self.track_status.setText(f"Theme added: {name}")
+        log(f"[Settings] custom theme {name}", 20)
+        self._close_bios_editor()
+        self.update_settings_list()
+
+    def _register_open_with_text(self):
+        if sys.platform != "win32":
+            return "Windows only."
+        try:
+            _n, cmd = register_open_with()
+        except Exception as e:
+            log(f"[OpenWith] register failed: {e}", 40)
+            return f"Register failed:\n{e}"
+        self.track_status.setText("Registered for Open with")
+        return (
+            "已登錄 dem_player。\n\n"
+            "在歌曲上按右鍵 → 開啟檔案方式 → 選擇其他應用程式 → dem_player\n"
+            "（Windows 11：顯示更多選項 → 開啟檔案方式）\n\n"
+            "這不會搶走預設播放器。\n"
+            "若播放器已經開著，檔案會送到這一個視窗。\n\n"
+            f"{cmd}"
+        )
+
+    def _on_bios_choice(self, item):
+        payload = item.data(Qt.ItemDataRole.UserRole)
+        kind = self._bios_kind
+        if kind == "themes":
+            token = str(payload or "")
+            if token == "add":
+                self._open_theme_form()
+                return
+            if token.startswith("del:"):
+                try:
+                    idx = int(token.split(":", 1)[1])
+                except ValueError:
+                    idx = -1
+                if 0 <= idx < len(self.custom_themes):
+                    removed = self.custom_themes.pop(idx)
+                    if self.current_theme_index >= len(self.all_themes()):
+                        self.current_theme_index = 0
+                    picked = self._theme_tuple()
+                    self.bg_color = picked[1]
+                    self.accent_color = picked[2]
+                    self.apply_theme()
+                    self._save_settings()
+                    self.track_status.setText(f"Theme deleted: {removed['name']}")
+                self._close_bios_editor()
+                self.update_settings_list()
+                return
+            if token.startswith("pick:"):
+                try:
+                    self.current_theme_index = int(token.split(":", 1)[1])
+                except ValueError:
+                    self.current_theme_index = 0
+                picked = self._theme_tuple()
+                self.bg_color = picked[1]
+                self.accent_color = picked[2]
                 self.apply_theme()
                 self._save_settings()
-                self.track_status.setText("Settings reset")
-                log("[Settings] All settings reset to default", 20)
-        elif text.startswith("About dem_player"):
-            self.show_about_dialog()
+            self._close_bios_editor()
+            self.update_settings_list()
+            return
+        if payload is False and kind in (
+            "bg_clear", "clear_history", "clear_counts", "clear_favs", "clear_cache", "reset",
+            "folder_remove",
+        ) or (isinstance(kind, str) and kind.startswith("folder_remove") and payload is False):
+            self._close_bios_editor()
+            return
+        self._apply_bios_value(kind, payload)
+        self._close_bios_editor()
         self.update_settings_list()
+
+    def _apply_bios_value(self, kind, payload):
+        if kind == "always_on_top":
+            if bool(payload) != self.is_always_on_top:
+                self.toggle_always_on_top()
+        elif kind == "screensaver":
+            self.allow_screensaver = bool(payload)
+            self._set_keep_awake(self.audio_engine.is_playing())
+            self._save_settings()
+        elif kind == "time_format":
+            self.time_format = payload
+            self._save_settings()
+            self.update_ui()
+        elif kind == "output":
+            self._switch_output_device(payload or "")
+        elif kind == "audio_level":
+            self.show_audio_level = bool(payload)
+            self.audio_level_frame.setVisible(self.show_audio_level)
+            self._save_settings()
+        elif kind == "audio_source":
+            if payload != self.audio_level_source:
+                self.toggle_audio_level_source()
+        elif kind == "audio_mode":
+            self.audio_level_mode = payload
+            self.text_eq.set_mode(self.audio_level_mode)
+            self._save_settings()
+        elif kind == "background":
+            self.background_mode = payload
+            self.apply_theme()
+            self._save_settings()
+            self.track_status.setText(f"Background: {self.background_mode}")
+        elif kind == "aero":
+            self.aero_opacity = int(payload)
+            self.apply_theme()
+            self._save_settings()
+        elif kind == "duration":
+            self.show_duration = bool(payload)
+            self._save_settings()
+            if self.current_dir:
+                self.refresh_current_directory()
+        elif kind == "cover":
+            self.show_cover_art = bool(payload)
+            self._save_settings()
+            self.load_cover_art(self.current_file_path)
+        elif kind == "counts":
+            self.show_play_counts = bool(payload)
+            self._save_settings()
+        elif kind == "log":
+            want = bool(payload)
+            if want != bool(core_mod.LOG_ENABLED):
+                self.toggle_log_enabled()
+        elif kind == "bg_clear" and payload:
+            self.clear_background_image()
+        elif kind == "clear_history" and payload:
+            self.history_paths = []
+            self._save_history()
+            self.track_status.setText("History cleared")
+            log("[Settings] History cleared", 20)
+        elif kind == "clear_counts" and payload:
+            self.play_counts = {}
+            self._save_history()
+            self.track_status.setText("Play counts cleared")
+        elif kind == "clear_favs" and payload:
+            self.favorites = {}
+            self._save_playlist()
+            self.track_status.setText("Favorites cleared")
+        elif kind == "clear_cache" and payload:
+            self.folder_cache.clear()
+            self._mark_cache_dirty()
+            self._write_cache()
+            self.track_status.setText("Cache cleared")
+        elif kind == "reset" and payload:
+            self._reset_all_settings()
+        elif isinstance(kind, str) and kind.startswith("folder_remove:") and payload:
+            try:
+                idx = int(kind.split(":", 1)[1])
+            except ValueError:
+                return
+            if 0 <= idx < len(self.source_paths):
+                removed = self.source_paths.pop(idx)
+                self._save_playlist()
+                self.track_status.setText(f"Removed: {removed}")
+                log(f"[Settings] Removed source folder: {removed}", 20)
+
+    def _reset_all_settings(self):
+        self.current_theme_index = 0
+        self.show_play_counts = True
+        self.show_duration = True
+        self.audio_level_mode = "all"
+        self.show_cover_art = True
+        self.show_audio_level = False
+        self.audio_level_source = "file"
+        self.loop_mode = 0
+        self.background_mode = "aero"
+        self.aero_opacity = 40
+        self._remove_custom_bg_file()
+        self.is_always_on_top = False
+        self.allow_screensaver = False
+        self.time_format = TIME_FORMAT_MM_SS_CC
+        self.output_device = ""
+        self.engine_mode = "auto"
+        self.bg_color = self.THEMES[0][1]
+        self.accent_color = self.THEMES[0][2]
+        self.volume_text.setValue(50)
+        self.loop_label.setText("Loop: OFF")
+        self.apply_theme()
+        self._save_settings()
+        self.track_status.setText("Settings reset")
+        log("[Settings] All settings reset to default", 20)
 
     def register_open_with_dialog(self):
         if sys.platform != "win32":
@@ -1468,7 +1876,7 @@ class MusicRoom(QMainWindow):
     def _build_about_text(self):
         yesno = lambda v: "yes" if v else "no"
         window_names = {0: "normal", 1: "fullscreen", 2: "mini", 3: "bar"}
-        theme_name = self.THEMES[self.current_theme_index][0] if 0 <= self.current_theme_index < len(self.THEMES) else "-"
+        theme_name = self._theme_tuple()[0]
         log_path = ""
         try:
             if core_mod.LOG_FILE is not None:
@@ -1850,9 +2258,10 @@ class MusicRoom(QMainWindow):
         self._save_settings()
 
     def cycle_theme(self):
-        self.current_theme_index = (self.current_theme_index + 1) % len(self.THEMES)
-        self.bg_color = self.THEMES[self.current_theme_index][1]
-        self.accent_color = self.THEMES[self.current_theme_index][2]
+        themes = self.all_themes()
+        self.current_theme_index = (self.current_theme_index + 1) % len(themes)
+        self.bg_color = themes[self.current_theme_index][1]
+        self.accent_color = themes[self.current_theme_index][2]
         self.apply_theme()
         self._save_settings()
         if self.show_settings:
@@ -1887,9 +2296,11 @@ class MusicRoom(QMainWindow):
         elif self.background_mode == "image":
             win_bg = "transparent"
             list_bg = "transparent"
+        elif self.background_mode == "transparent":
+            # See-through. An opaque theme color here paints every QWidget solid.
+            win_bg = "transparent"
+            list_bg = "transparent"
         else:
-            # solid and transparent match 0.20: theme color, frames clear.
-            # transparent then paints the central widget at rgba(0,0,0,0.5).
             win_bg = bg
             list_bg = "transparent"
         pt = UI_FONT_PT
@@ -1918,6 +2329,7 @@ class MusicRoom(QMainWindow):
                 btn.setStyleSheet(f"color: {c}; background: transparent; border: 1px solid {c};")
         if self.drag_frame is not None:
             self.drag_frame.set_accent_color(c)
+        self._style_bios()
 
     # ================== TRACK MODEL ==================
     # UI-only: hide emoji in song titles. Real filenames / cache keys stay unchanged.
@@ -1990,6 +2402,8 @@ class MusicRoom(QMainWindow):
     # ================== KEYS ==================
     def keyPressEvent(self, event: QKeyEvent):
         key = event.key()
+        if self.show_settings and self._settings_key(key):
+            return
         if key == Qt.Key.Key_Backspace:
             if self.search_input.hasFocus():
                 self.search_input.keyPressEvent(event)
@@ -2106,18 +2520,26 @@ class MusicRoom(QMainWindow):
 
     def toggle_settings_page(self):
         if self.show_settings:
+            self._close_bios_editor()
+            if getattr(self, "bios_root", None) is not None:
+                self.bios_root.hide()
             self.left_stack.setCurrentIndex(0)
             self.show_settings = False
             self.file_list.setFocus()
         else:
             if self.search_input.hasFocus():
                 self.search_input.clearFocus()
-                self.file_list.setFocus()
-            self.left_stack.setCurrentIndex(1)
+            self.stop_current_engine()
+            self._set_keep_awake(False)
+            self.track_status.setText("Stopped")
+            self._mark_now_playing(self.current_track_info)
             self.show_settings = True
+            self._place_bios()
+            self.bios_root.show()
+            self.bios_root.raise_()
+            self.update_settings_list()
             self.settings_list.setFocus()
             self.settings_list.setCurrentRow(0)
-            self.update_settings_list()
 
     def do_search(self):
         keyword = self.search_input.text().strip().lower()
@@ -2362,13 +2784,45 @@ class MusicRoom(QMainWindow):
 
     def stop_current_engine(self):
         self._media_end_handled = True
+        self._expect_stream = None
         self._cue_end_timer.stop()
         self._cue_end_ms = None
-        if self.conv_thread and self.conv_thread.isRunning():
-            self.conv_thread.requestInterruption()
-            self.conv_thread.wait(80)
-            self.conv_thread = None
+        self._drop_bg_thread("conv_thread")
+        self._drop_bg_thread("_decode_thread")
         self.audio_engine.stop()
+
+    def _drop_bg_thread(self, attr):
+        th = getattr(self, attr, None)
+        if th is None:
+            return
+        for name in ("decoded", "finished", "progress", "done"):
+            sig = getattr(th, name, None)
+            if sig is None:
+                continue
+            try:
+                sig.disconnect()
+            except Exception:
+                pass
+        if th.isRunning():
+            th.requestInterruption()
+            self._orphan_threads.append(th)
+        setattr(self, attr, None)
+
+    def _join_bg_threads(self, timeout_ms=3000):
+        threads = list(self._orphan_threads)
+        for attr in ("conv_thread", "_decode_thread", "_scan_thread"):
+            th = getattr(self, attr, None)
+            if th is not None and th not in threads:
+                threads.append(th)
+        for th in threads:
+            try:
+                if th.isRunning():
+                    th.requestInterruption()
+                    if not th.wait(timeout_ms):
+                        log(f"[Close] thread still running after {timeout_ms}ms", 40)
+            except Exception as e:
+                log(f"[Close] thread join: {e}", 40)
+        self._orphan_threads = []
     def _add_to_cache(self, original_key, wav_path):
         if original_key in self.convert_cache:
             old_wav = self.convert_cache.pop(original_key)
@@ -2554,6 +3008,7 @@ class MusicRoom(QMainWindow):
                 msg = "Need asapconv.exe next to the player for SAP/TM8"
             else:
                 msg = "Cannot play - required engine missing"
+            log(f"[Play] missing engine for {path}", 40)
             self.track_status.setText(msg)
             self._mark_now_playing(None)
             return
@@ -2568,21 +3023,36 @@ class MusicRoom(QMainWindow):
 
         log(f"[Play] {path} engine={engine} start_ms={track.get('start_ms', 0)}", 20)
 
+        start_ms = track.get("start_ms", 0) or 0
+        ext = os.path.splitext(str(path))[1].lower()
+        is_url = str(path).lower().startswith(("http://", "https://", "mms://", "mmsh://", "rtmp://", "rtmps://", "rtsp://"))
+        if engine == "audio" and ext in FFMPEG_EXT and not is_url:
+            fname = os.path.basename(path)
+            self.track_status.setText(f"Loading [{fname}]")
+            self._update_track_display(track)
+            self._media_end_handled = True
+            self._decode_thread = FfmpegDecodeThread(path)
+            self._decode_thread.decoded.connect(
+                lambda wav, p=path, t=track, sm=start_ms: self._on_ffmpeg_decoded(p, t, sm, wav)
+            )
+            self._decode_thread.start()
+            return
+
         if engine in ("chiptune_cli", "asap", "zxtune"):
             fname = os.path.basename(path)
             self.track_status.setText(f"Loading [{fname}]")
             self._update_track_display(track)
             self.current_engine = engine
-            self._media_end_handled = False
+            self._media_end_handled = True
             self.conv_thread = ConversionThread(engine, path)
-            self.conv_thread.finished.connect(lambda wav: self.on_conversion_finished(wav, engine))
+            self.conv_thread.finished.connect(lambda wav, eng=engine: self.on_conversion_finished(wav, eng))
             self.conv_thread.start()
             return
 
-        start_ms = track.get("start_ms", 0) or 0
         ok = self.audio_engine.play(path, start_ms=start_ms)
         if not ok:
             err = self.audio_engine.last_error or "unsupported format"
+            log(f"[Play] failed: {err} path={path}", 40)
             self.track_status.setText(f"Cannot play - {err}")
             self._mark_now_playing(None)
             return
@@ -2598,6 +3068,66 @@ class MusicRoom(QMainWindow):
         self.load_cover_art(path)
         self.update_now_playing_marker()
         self._media_end_handled = False
+        if is_url:
+            self._expect_stream = path
+            QTimer.singleShot(2000, lambda p=path: self._check_stream_died(p))
+
+    def _on_ffmpeg_decoded(self, path, track, start_ms, wav):
+        if self.current_file_path != path:
+            if wav and os.path.isfile(wav):
+                try:
+                    os.remove(wav)
+                except Exception:
+                    pass
+            return
+        if not wav or not os.path.isfile(wav):
+            if not probe_ffmpeg():
+                msg = "Need ffmpeg.exe next to the player for M4A/AAC/WMA/OPUS"
+            else:
+                msg = ffmpeg_last_error() or "Cannot decode (file damaged or unsupported)"
+            if msg == "cancelled":
+                return
+            log(f"[Play] {msg}: {path}", 40)
+            self.track_status.setText(msg)
+            self._mark_now_playing(None)
+            return
+        self._add_to_cache(self.make_track_key(track), wav)
+        ok = self.audio_engine.play(wav, start_ms=start_ms or 0)
+        if not ok:
+            err = self.audio_engine.last_error or "Cannot play decoded wav"
+            log(f"[Play] decoded wav failed: {err}", 40)
+            self.track_status.setText(f"Cannot play - {err}")
+            self._mark_now_playing(None)
+            return
+        self.current_engine = self.audio_engine.current_name or "ffmpeg"
+        self.spectrum_source_path = wav
+        QTimer.singleShot(200, self.update_volume_to_actual)
+        QTimer.singleShot(1000, lambda p=path: self._fetch_and_cache_duration(p))
+        self._update_track_display(track)
+        self.track_status.setText("Playing")
+        self._set_keep_awake(True)
+        self.add_to_history(path)
+        self.increment_play_count(path)
+        self.load_cover_art(path)
+        self.update_now_playing_marker()
+        self._media_end_handled = False
+
+    def _check_stream_died(self, path):
+        if self._expect_stream != path or self.current_file_path != path:
+            return
+        self._expect_stream = None
+        try:
+            if self.audio_engine.is_playing() or self.audio_engine.is_paused():
+                return
+            curr, _total = self.audio_engine.get_time()
+            if curr and curr > 800:
+                return
+        except Exception:
+            pass
+        log(f"[Play] stream ended immediately: {path}", 40)
+        self.track_status.setText("Stream ended immediately (bad URL or ffmpeg)")
+        self._mark_now_playing(None)
+
     def _update_track_display(self, track):
         path = track.get("path", "")
         if track.get("cue_path"):
@@ -2713,10 +3243,10 @@ class MusicRoom(QMainWindow):
         return paths
 
     def start_duration_scan(self):
-        if self._scan_queue:
-            self._scan_queue = []
+        if self._scan_thread and self._scan_thread.isRunning():
+            self._scan_thread.requestInterruption()
             self.track_status.setText("Duration scan cancelled")
-            log("[Scan] cancelled", 20)
+            log("[Scan] cancelled", 30)
             return
         if not self.current_dir or not os.path.isdir(self.current_dir):
             self.track_status.setText("F10: open a music folder first")
@@ -2725,37 +3255,30 @@ class MusicRoom(QMainWindow):
         if not paths:
             self.track_status.setText("No audio files in this folder")
             return
-        self._scan_queue = list(paths)
         self._scan_total = len(paths)
-        self._scan_done = 0
-        self._scan_ok = 0
         folder_name = os.path.basename(self.current_dir.rstrip("\\/")) or self.current_dir
         self.track_status.setText(f"Scan {folder_name}: 0/{self._scan_total}")
         log(f"[Scan] folder={self.current_dir} files={self._scan_total}", 20)
-        QTimer.singleShot(0, self._scan_duration_step)
+        self._scan_thread = DurationScanThread(paths)
+        self._scan_thread.progress.connect(self._on_scan_progress)
+        self._scan_thread.done.connect(self._on_scan_done)
+        self._scan_thread.start()
 
-    def _scan_duration_step(self):
-        if not self._scan_queue:
+    def _on_scan_progress(self, done, total, path, ms):
+        self.track_status.setText(f"Scan this folder: {done}/{total}")
+        if ms and ms > 0:
+            self._fetch_and_cache_duration(path, live_ms=ms)
+
+    def _on_scan_done(self, ok, total):
+        cancelled = bool(self._scan_thread and self._scan_thread.isInterruptionRequested())
+        if cancelled:
+            self.track_status.setText("Duration scan cancelled")
+            log(f"[Scan] cancelled ok={ok}/{total}", 30)
             return
-        batch = 0
-        while self._scan_queue and batch < 5:
-            path = self._scan_queue.pop(0)
-            self._scan_done += 1
-            batch += 1
-            ms = probe_file_duration_ms(path)
-            if ms > 0:
-                self._scan_ok += 1
-                self._fetch_and_cache_duration(path, live_ms=ms)
-        if self._scan_queue:
-            self.track_status.setText(
-                f"Scan this folder: {self._scan_done}/{self._scan_total}")
-            QTimer.singleShot(0, self._scan_duration_step)
-        else:
-            self._write_cache()
-            self.track_status.setText(
-                f"Cached {self._scan_ok}/{self._scan_total} in this folder"
-                "  (MOD/MIDI when played)")
-            log(f"[Scan] done ok={self._scan_ok}/{self._scan_total} dir={self.current_dir}", 20)
+        self._write_cache()
+        self.track_status.setText(
+            f"Cached {ok}/{total} in this folder  (MOD/MIDI when played)")
+        log(f"[Scan] done ok={ok}/{total} dir={self.current_dir}", 20)
     def increment_play_count(self, filepath):
         if filepath:
             self.play_counts[filepath] = self.play_counts.get(filepath, 0) + 1
@@ -2782,7 +3305,16 @@ class MusicRoom(QMainWindow):
             self._set_keep_awake(True)
             self._media_end_handled = False
         else:
-            self.track_status.setText("Cannot play - converter failed")
+            log(f"[Play] converter failed engine={engine} path={self.current_file_path}", 40)
+            if engine == "zxtune":
+                msg = "ZXTune failed — file damaged, or zxtune123.exe missing"
+            elif engine in ("chiptune_cli", "furnace"):
+                msg = "Furnace failed — file damaged, or furnace.exe missing"
+            elif engine == "asap":
+                msg = "ASAP failed — file damaged, or asapconv.exe missing"
+            else:
+                msg = "Cannot play - converter failed"
+            self.track_status.setText(msg)
 
     def toggle_pause(self):
         if self.audio_engine.is_playing():
@@ -3030,15 +3562,48 @@ class MusicRoom(QMainWindow):
         back = QListWidgetItem("[..]  (GO BACK)")
         back.setData(Qt.ItemDataRole.UserRole, {"path": "ACTION_BACK"})
         self.file_list.addItem(back)
-        for filepath in self.favorites.get(lid, []):
+        paths = list(self.favorites.get(lid, []))
+        if paths:
+            exp = QListWidgetItem("[EXPORT] save this list as M3U")
+            exp.setData(Qt.ItemDataRole.UserRole, {"path": "ACTION_EXPORT_M3U", "list_id": lid})
+            self.file_list.addItem(exp)
+        for filepath in paths:
             track = self._track_from_path(filepath)
             self.file_list.addItem(self._make_item(track))
             self.current_playlist.append(track)
         if self.file_list.count() > 0:
             self.file_list.setCurrentRow(0)
         self.path_label.setText(f"FAVORITES {lid}")
+        if not paths:
+            self.track_status.setText(f"Favorites {lid} is empty")
         self.file_list.setUpdatesEnabled(True)
         self.update_now_playing_marker()
+
+    def export_favorites_m3u(self, lid=None):
+        if not lid:
+            if not (self.current_dir or "").startswith("FAVORITES:"):
+                self.track_status.setText("Open a favorites list first")
+                return
+            lid = self.current_dir.split(":", 1)[1]
+        paths = [p for p in (self.favorites.get(lid) or []) if p]
+        if not paths:
+            self.track_status.setText(f"Favorites {lid} is empty")
+            return
+        default = os.path.join(app_dir(), f"favorites_{lid}.m3u")
+        dest, _ = QFileDialog.getSaveFileName(
+            self, "Export favorites", default, "M3U playlist (*.m3u)")
+        if not dest:
+            return
+        if not dest.lower().endswith(".m3u"):
+            dest += ".m3u"
+        try:
+            write_m3u(dest, paths)
+        except Exception as e:
+            log(f"[M3U] export failed: {e}", 40)
+            self.track_status.setText(f"Export failed: {e}")
+            return
+        log(f"[M3U] exported favorites {lid} -> {dest} n={len(paths)}", 20)
+        self.track_status.setText(f"Exported favorites {lid} ({len(paths)})")
 
     def show_history_list(self):
         log("[UI] show_history_list", 20)
@@ -3237,6 +3802,9 @@ class MusicRoom(QMainWindow):
         if data.get("path") == "ACTION_BACK":
             self.go_back()
             return
+        if data.get("path") == "ACTION_EXPORT_M3U":
+            self.export_favorites_m3u(data.get("list_id"))
+            return
         if data.get("is_source"):
             p = data["path"]
             if p == "HISTORY":
@@ -3346,16 +3914,20 @@ class MusicRoom(QMainWindow):
                 self.track_status.setText("Paused")
             else:
                 status = self.track_status.text() or ""
-                if status not in ("Paused", "Playing (cached)") and not status.startswith("Loading"):
+                if status not in ("Paused", "Playing (cached)") and not status.startswith("Loading") and not status.startswith("Scan") and not status.startswith("Exported"):
                     self.track_status.setText("Playing")
         else:
             status = self.track_status.text() or ""
-            converting = bool(self.conv_thread and self.conv_thread.isRunning())
+            converting = bool(
+                (self.conv_thread and self.conv_thread.isRunning())
+                or (self._decode_thread and self._decode_thread.isRunning())
+            )
             if (
                 self.current_file_path
                 and not self._media_end_handled
                 and not converting
                 and not status.startswith("Loading")
+                and not status.startswith("Scan")
                 and status not in ("Paused",)
             ):
                 QTimer.singleShot(0, self.on_media_end)
@@ -3390,9 +3962,8 @@ class MusicRoom(QMainWindow):
         self._write_cache()
         self.stop_system_audio_capture()
         self.stop_current_engine()
-        if self.conv_thread and self.conv_thread.isRunning():
-            self.conv_thread.requestInterruption()
-            self.conv_thread.wait(1000)
+        self._drop_bg_thread("_scan_thread")
+        self._join_bg_threads(3000)
         self.audio_engine.free()
         for wav in self.convert_cache.values():
             if os.path.exists(wav):
