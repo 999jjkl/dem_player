@@ -1,4 +1,4 @@
-"""dem_player 0.22.8 — PySide6 UI. Playback via audio.AudioEngine."""
+"""dem_player 0.21 — PySide6 UI. Playback via audio.AudioEngine (no VLC / no BASS)."""
 import sys
 import os
 import shutil
@@ -694,6 +694,8 @@ class MusicRoom(QMainWindow):
         self.show_settings = False
         self._bios_page = 0
         self._bios_kind = ""
+        self._settings_resume_track = None
+        self.theme_mode = "hex"
         self.left_visible = True
 
         self.sd_stream = None
@@ -730,7 +732,7 @@ class MusicRoom(QMainWindow):
 
         self.setMouseTracking(True)
         self.file_list.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.settings_list.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.settings_list.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.search_input.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.progress_text.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.volume_text.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -1273,7 +1275,6 @@ class MusicRoom(QMainWindow):
         lay.addWidget(self.bios_title)
         lay.addWidget(self.bios_page_label)
         self.settings_list.setParent(self.bios_root)
-        self.settings_list.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.settings_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         lay.addWidget(self.settings_list, 1)
         self.bios_hint = QLabel("←/→ Page    ↑/↓ Move    Enter Edit    Esc Back")
@@ -1300,17 +1301,18 @@ class MusicRoom(QMainWindow):
         self.bios_form = QWidget()
         form = QVBoxLayout(self.bios_form)
         form.setContentsMargins(0, 0, 0, 0)
-        self.theme_name = QLineEdit()
+        self.theme_mode_label = QLabel("Input: HEX    ←/→ RGB")
+        self.theme_mode_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.theme_bg = QLineEdit()
         self.theme_accent = QLineEdit()
-        self.theme_name.setPlaceholderText("Name")
         self.theme_bg.setPlaceholderText("Background #RRGGBB")
         self.theme_accent.setPlaceholderText("Accent #RRGGBB")
-        for w in (self.theme_name, self.theme_bg, self.theme_accent):
+        form.addWidget(self.theme_mode_label)
+        for w in (self.theme_bg, self.theme_accent):
             w.setFont(self.dos_font)
             w.installEventFilter(self)
             form.addWidget(w)
-        self.bios_save_btn = QPushButton("Save Theme")
+        self.bios_save_btn = QPushButton("Save Colour")
         self.bios_cancel_btn = QPushButton("Cancel")
         self.bios_save_btn.setFont(self.dos_font)
         self.bios_cancel_btn.setFont(self.dos_font)
@@ -1325,6 +1327,7 @@ class MusicRoom(QMainWindow):
         el.addWidget(self.bios_editor_hint)
         self.settings_list.installEventFilter(self)
         self.bios_editor_list.installEventFilter(self)
+        self._block_setting_mouse(self.bios_root)
 
     def _style_bios(self):
         if getattr(self, "bios_root", None) is None:
@@ -1403,7 +1406,13 @@ class MusicRoom(QMainWindow):
     def eventFilter(self, obj, event):
         if self.show_settings and event.type() == QEvent.Type.KeyPress:
             key = event.key()
-            if obj in (getattr(self, "theme_name", None), getattr(self, "theme_bg", None), getattr(self, "theme_accent", None)):
+            if obj in (getattr(self, "theme_bg", None), getattr(self, "theme_accent", None)):
+                if key == Qt.Key.Key_Left:
+                    self._set_theme_input_mode("hex")
+                    return True
+                if key == Qt.Key.Key_Right:
+                    self._set_theme_input_mode("rgb")
+                    return True
                 if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                     self._save_custom_theme()
                     return True
@@ -1454,7 +1463,7 @@ class MusicRoom(QMainWindow):
                 ("counts", "Show Play Counts", yn(self.show_play_counts)),
             ]),
             ("Library", library),
-            ("System", [
+            ("Options", [
                 ("log", "Log Save", yn(core_mod.LOG_ENABLED)),
                 ("openwith", "Register Open With", ""),
                 ("clear_history", "Clear History", ""),
@@ -1493,11 +1502,20 @@ class MusicRoom(QMainWindow):
             return
         self._edit_setting(sid)
 
+    def _block_setting_mouse(self, root):
+        root.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        for child in root.findChildren(QWidget):
+            child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+
     def _edit_setting(self, sid):
         if sid == "always_on_top":
-            self._open_choice("Always on Top", "always_on_top", [("No", False), ("Yes", True)], self.is_always_on_top)
+            self.toggle_always_on_top()
+            self.update_settings_list()
         elif sid == "screensaver":
-            self._open_choice("Screensaver While Playing", "screensaver", [("No", False), ("Yes", True)], self.allow_screensaver)
+            self.allow_screensaver = not self.allow_screensaver
+            self._set_keep_awake(False)
+            self._save_settings()
+            self.update_settings_list()
         elif sid == "themes":
             self._open_theme_choices()
         elif sid == "time_format":
@@ -1508,7 +1526,10 @@ class MusicRoom(QMainWindow):
                 rows.append((str(name), did))
             self._open_choice("Output Device", "output", rows, self.output_device or "")
         elif sid == "audio_level":
-            self._open_choice("Audio Level", "audio_level", [("Off", False), ("On", True)], self.show_audio_level)
+            self.show_audio_level = not self.show_audio_level
+            self.audio_level_frame.setVisible(self.show_audio_level)
+            self._save_settings()
+            self.update_settings_list()
         elif sid == "audio_source":
             self._open_choice("Audio Level Source", "audio_source", [("file", "file"), ("system", "system")], self.audio_level_source)
         elif sid == "audio_mode":
@@ -1525,13 +1546,20 @@ class MusicRoom(QMainWindow):
             self.pick_background_image()
             self.update_settings_list()
         elif sid == "bg_clear":
-            self._open_choice("Clear Background Image", "bg_clear", [("No", False), ("Yes", True)], False)
+            self.clear_background_image()
+            self.update_settings_list()
         elif sid == "duration":
-            self._open_choice("Show Duration", "duration", [("No", False), ("Yes", True)], self.show_duration)
+            self.show_duration = not self.show_duration
+            self._save_settings()
+            self.update_settings_list()
         elif sid == "cover":
-            self._open_choice("Show Cover Art", "cover", [("No", False), ("Yes", True)], self.show_cover_art)
+            self.show_cover_art = not self.show_cover_art
+            self._save_settings()
+            self.update_settings_list()
         elif sid == "counts":
-            self._open_choice("Show Play Counts", "counts", [("No", False), ("Yes", True)], self.show_play_counts)
+            self.show_play_counts = not self.show_play_counts
+            self._save_settings()
+            self.update_settings_list()
         elif sid == "folder_add":
             folder = QFileDialog.getExistingDirectory(self, "Select music folder")
             if folder:
@@ -1548,8 +1576,21 @@ class MusicRoom(QMainWindow):
                 idx = int(sid.split(":", 1)[1])
             except ValueError:
                 return
-            if 0 <= idx < len(self.source_paths):
-                self._open_choice("Remove Folder", sid, [("No", False), ("Yes", True)], False)
+            if not (0 <= idx < len(self.source_paths)):
+                return
+            removed = self.source_paths[idx]
+            reply = QMessageBox.question(
+                self, "Confirm Removal",
+                f"Remove this music folder from the list?\n\n{removed}\n\n"
+                "(Removed from the list only. Files on disk are NOT deleted.)",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply == QMessageBox.StandardButton.Yes:
+                self.source_paths.pop(idx)
+                self._save_playlist()
+                self.track_status.setText(f"Removed: {removed}")
+                log(f"[Settings] Removed source folder: {removed}", 20)
+            self.update_settings_list()
         elif sid == "refresh":
             self.refresh_current_directory()
             self.track_status.setText("File list refreshed")
@@ -1557,20 +1598,56 @@ class MusicRoom(QMainWindow):
             self.toggle_settings_page()
             self.start_duration_scan()
         elif sid == "log":
-            self._open_choice("Log Save", "log", [("No", False), ("Yes", True)], bool(core_mod.LOG_ENABLED))
+            self.toggle_log_enabled()
+            self.update_settings_list()
         elif sid == "openwith":
-            self._show_bios_text("Open With", self._register_open_with_text())
-        elif sid in ("clear_history", "clear_counts", "clear_favs", "clear_cache", "reset"):
-            titles = {
-                "clear_history": "Clear History",
-                "clear_counts": "Clear Play Counts",
-                "clear_favs": "Clear Favorites",
-                "clear_cache": "Clear Duration Cache",
-                "reset": "Reset All Settings",
-            }
-            self._open_choice(titles[sid], sid, [("No", False), ("Yes", True)], False)
+            self.register_open_with_dialog()
+        elif sid == "clear_history":
+            self._confirm_clear("Clear all play history?", self._do_clear_history)
+        elif sid == "clear_counts":
+            self._confirm_clear("Clear all play counts?", self._do_clear_counts)
+        elif sid == "clear_favs":
+            self._confirm_clear("Clear all favorites lists?", self._do_clear_favs)
+        elif sid == "clear_cache":
+            self._confirm_clear("Clear duration cache? Duration labels will be re-scanned.", self._do_clear_cache)
+        elif sid == "reset":
+            self._confirm_clear("Reset all settings to default?", self._reset_all_settings)
         elif sid == "about":
-            self._show_bios_text(f"About dem_player {APP_VERSION}", self._build_about_text())
+            self.show_about_dialog()
+
+    def _confirm_clear(self, question, fn):
+        reply = QMessageBox.question(
+            self, "Confirm", question,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            fn()
+        self.update_settings_list()
+
+    def _do_clear_history(self):
+        self.history_paths = []
+        self._save_history()
+        self.track_status.setText("History cleared")
+        log("[Settings] History cleared", 20)
+
+    def _do_clear_counts(self):
+        self.play_counts = {}
+        self._save_history()
+        self.track_status.setText("Play counts cleared")
+        log("[Settings] Play counts cleared", 20)
+
+    def _do_clear_favs(self):
+        self.favorites = {}
+        self._save_playlist()
+        self.track_status.setText("Favorites cleared")
+        log("[Settings] Favorites cleared", 20)
+
+    def _do_clear_cache(self):
+        self.folder_cache.clear()
+        self._mark_cache_dirty()
+        self._write_cache()
+        self.track_status.setText("Cache cleared")
+        log("[Settings] Duration cache cleared", 20)
 
     def _open_choice(self, title, kind, rows, current):
         self._bios_kind = kind
@@ -1597,7 +1674,7 @@ class MusicRoom(QMainWindow):
         for i, (name, _bg, _ac) in enumerate(self.all_themes()):
             tag = name if i < len(self.THEMES) else f"{name}  (custom)"
             rows.append((tag, f"pick:{i}"))
-        rows.append(("Add Theme...", "add"))
+        rows.append(("Add Colour...", "add"))
         for i, t in enumerate(self.custom_themes or []):
             rows.append((f"Delete {t['name']}", f"del:{i}"))
         self._open_choice("Themes", "themes", rows, f"pick:{self.current_theme_index}")
@@ -1614,36 +1691,90 @@ class MusicRoom(QMainWindow):
         self._place_bios_editor()
         self.bios_text.setFocus()
 
+    def _set_theme_input_mode(self, mode):
+        mode = "rgb" if mode == "rgb" else "hex"
+        old = getattr(self, "theme_mode", "hex")
+        if old != mode and self.theme_bg.text().strip():
+            self.theme_mode = old
+            bg = self._parse_colour(self.theme_bg.text()) or "#000000"
+            accent = self._parse_colour(self.theme_accent.text()) or "#FFFFFF"
+            self.theme_mode = mode
+            if mode == "rgb":
+                self.theme_bg.setText(self._hex_to_csv(bg))
+                self.theme_accent.setText(self._hex_to_csv(accent))
+            else:
+                self.theme_bg.setText(bg)
+                self.theme_accent.setText(accent)
+        self.theme_mode = mode
+        if mode == "hex":
+            self.theme_mode_label.setText("Input: HEX    ←/→ RGB")
+            self.theme_bg.setPlaceholderText("Background #RRGGBB")
+            self.theme_accent.setPlaceholderText("Accent #RRGGBB")
+        else:
+            self.theme_mode_label.setText("Input: RGB    ← HEX / →")
+            self.theme_bg.setPlaceholderText("Background R,G,B")
+            self.theme_accent.setPlaceholderText("Accent R,G,B")
+
+    def _hex_to_csv(self, hex_color):
+        h = str(hex_color or "#000000").lstrip("#")
+        try:
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        except (ValueError, IndexError):
+            r = g = b = 0
+        return f"{r},{g},{b}"
+
+    def _parse_colour(self, text):
+        text = (text or "").strip()
+        if self.theme_mode == "rgb":
+            parts = [p.strip() for p in text.replace(" ", "").split(",") if p.strip() != ""]
+            if len(parts) != 3:
+                return None
+            try:
+                nums = [int(p) for p in parts]
+            except ValueError:
+                return None
+            if any(n < 0 or n > 255 for n in nums):
+                return None
+            return "#{:02X}{:02X}{:02X}".format(*nums)
+        if not text.startswith("#"):
+            text = "#" + text
+        hexdigits = set("0123456789abcdefABCDEF")
+        if len(text) == 7 and all(ch in hexdigits for ch in text[1:]):
+            return text.upper()
+        return None
+
+    def _next_theme_name(self):
+        used = {str(t.get("name") or "") for t in (self.custom_themes or [])}
+        n = 1
+        while f"Custom {n:02d}" in used:
+            n += 1
+        return f"Custom {n:02d}"
+
     def _open_theme_form(self):
         self._bios_kind = "theme_form"
         self.bios_editor_list.hide()
         self.bios_text.hide()
         self.bios_form.show()
-        self.bios_editor_title.setText("Add Theme")
-        self.bios_editor_hint.setText("Enter save    Esc back")
-        self.theme_name.clear()
+        self.bios_editor_title.setText("Add Colour")
+        self.bios_editor_hint.setText("← HEX   → RGB    Enter save    Esc back")
+        self._set_theme_input_mode("hex")
         self.theme_bg.setText("#000000")
-        self.theme_accent.setText(self.accent_color if str(self.accent_color).startswith("#") else "#FFFFFF")
+        self.theme_accent.setText("#FFFFFF")
         self.bios_editor.show()
         self._place_bios_editor()
-        self.theme_name.setFocus()
+        self.theme_bg.setFocus()
 
     def _save_custom_theme(self):
-        name = self.theme_name.text().strip()[:32]
-        bg = self.theme_bg.text().strip()
-        accent = self.theme_accent.text().strip()
-        if not name:
-            self.track_status.setText("Theme name is empty")
+        bg = self._parse_colour(self.theme_bg.text())
+        accent = self._parse_colour(self.theme_accent.text())
+        if not bg or not accent:
+            if self.theme_mode == "rgb":
+                self.track_status.setText("RGB is R,G,B  each 0-255")
+            else:
+                self.track_status.setText("HEX is #RRGGBB")
             return
-        if not bg.startswith("#"):
-            bg = "#" + bg
-        if not accent.startswith("#"):
-            accent = "#" + accent
-        hexdigits = set("0123456789abcdefABCDEF")
-        if len(bg) != 7 or len(accent) != 7 or any(ch not in hexdigits for ch in bg[1:] + accent[1:]):
-            self.track_status.setText("Color must be #RRGGBB")
-            return
-        self.custom_themes.append({"name": name, "bg": bg.upper(), "accent": accent.upper()})
+        name = self._next_theme_name()
+        self.custom_themes.append({"name": name, "bg": bg, "accent": accent})
         self.custom_themes = self.custom_themes[:24]
         self.current_theme_index = len(self.THEMES) + len(self.custom_themes) - 1
         picked = self._theme_tuple()
@@ -1651,8 +1782,8 @@ class MusicRoom(QMainWindow):
         self.accent_color = picked[2]
         self.apply_theme()
         self._save_settings()
-        self.track_status.setText(f"Theme added: {name}")
-        log(f"[Settings] custom theme {name}", 20)
+        self.track_status.setText(f"Colour saved: {name}")
+        log(f"[Settings] custom theme {name} {bg} {accent}", 20)
         self._close_bios_editor()
         self.update_settings_list()
 
@@ -2433,7 +2564,7 @@ class MusicRoom(QMainWindow):
         elif key == Qt.Key.Key_F6:
             self.cycle_window_mode()
         elif key == Qt.Key.Key_F7:
-            if self.window_mode != 2:
+            if self.window_mode not in (2, 3):
                 self.toggle_settings_page()
         elif key == Qt.Key.Key_F8:
             if self.window_mode == 2:
@@ -2520,19 +2651,32 @@ class MusicRoom(QMainWindow):
 
     def toggle_settings_page(self):
         if self.show_settings:
+            resume = self._settings_resume_track
+            self._settings_resume_track = None
             self._close_bios_editor()
             if getattr(self, "bios_root", None) is not None:
                 self.bios_root.hide()
             self.left_stack.setCurrentIndex(0)
             self.show_settings = False
             self.file_list.setFocus()
+            if resume and self.current_file_path:
+                self.play_file(resume)
         else:
+            if self.window_mode in (2, 3):
+                return
             if self.search_input.hasFocus():
                 self.search_input.clearFocus()
+            playing = False
+            try:
+                playing = bool(self.audio_engine.is_playing())
+            except Exception:
+                playing = False
+            self._settings_resume_track = None
+            if playing and self.current_track_info:
+                self._settings_resume_track = self.current_track_info
             self.stop_current_engine()
             self._set_keep_awake(False)
             self.track_status.setText("Stopped")
-            self._mark_now_playing(self.current_track_info)
             self.show_settings = True
             self._place_bios()
             self.bios_root.show()
