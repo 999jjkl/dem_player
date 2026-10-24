@@ -7,6 +7,7 @@ import subprocess
 # ==========================================
 # If furnace.exe is in your system PATH, you can just leave this as "furnace".
 # Otherwise, replace it with the exact path to your executable file.
+# This let the ftm/dnm file to wav and let player to play 
 FURNACE_PATH = "furnace.exe" 
 
 def browse_input():
