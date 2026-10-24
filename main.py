@@ -519,6 +519,195 @@ class DevicePickerDialog(QDialog):
         self.accept()
 
 
+class ColourDialog(QDialog):
+    """Separate window for a new colour. Mouse works only here."""
+
+    def __init__(self, parent=None, font=None):
+        super().__init__(parent)
+        self.setWindowTitle("Add Colour")
+        self.setModal(True)
+        self.setMinimumWidth(460)
+        self.mode = "hex"
+        self.result_bg = None
+        self.result_accent = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(8)
+
+        title = QLabel("Add Colour")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        mode_row = QHBoxLayout()
+        self.btn_hex = QPushButton("HEX")
+        self.btn_rgb = QPushButton("RGB")
+        self.btn_swap = QPushButton("Swap")
+        self.btn_hex.clicked.connect(lambda: self._set_mode("hex"))
+        self.btn_rgb.clicked.connect(lambda: self._set_mode("rgb"))
+        self.btn_swap.clicked.connect(self._swap)
+        mode_row.addWidget(self.btn_hex)
+        mode_row.addWidget(self.btn_rgb)
+        mode_row.addWidget(self.btn_swap)
+        layout.addLayout(mode_row)
+
+        self.bg_edit = QLineEdit("#000000")
+        self.ac_edit = QLineEdit("#FFFFFF")
+        self.bg_swatch = QLabel()
+        self.ac_swatch = QLabel()
+        self.bg_swatch.setMinimumSize(72, 28)
+        self.ac_swatch.setMinimumSize(72, 28)
+        layout.addLayout(self._colour_row("Background", self.bg_edit, self.bg_swatch))
+        layout.addLayout(self._colour_row("Accent", self.ac_edit, self.ac_swatch))
+
+        self.preview = QLabel("e.g.  Themes                         [Custom]")
+        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview.setMinimumHeight(64)
+        layout.addWidget(self.preview)
+
+        preset_row = QHBoxLayout()
+        for label, bg, accent in (
+            ("Black", "#000000", "#FFFFFF"),
+            ("White", "#FFFFFF", "#000000"),
+            ("Green", "#000000", "#00FF00"),
+            ("Cyan", "#000000", "#00FFFF"),
+            ("Red", "#000000", "#FF0000"),
+            ("Yellow", "#000000", "#FFFF00"),
+        ):
+            btn = QPushButton(label)
+            btn.setStyleSheet(
+                f"background-color: {bg}; color: {accent}; border: 1px solid {accent};")
+            btn.clicked.connect(lambda _=False, b=bg, a=accent: self._apply_preset(b, a))
+            preset_row.addWidget(btn)
+            if font is not None:
+                btn.setFont(font)
+        layout.addLayout(preset_row)
+
+        self.hint = QLabel("HEX #RRGGBB    or    RGB R,G,B")
+        self.hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.hint)
+
+        buttons = QHBoxLayout()
+        save_btn = QPushButton("Save")
+        cancel_btn = QPushButton("Cancel")
+        save_btn.clicked.connect(self._save)
+        cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(save_btn)
+        buttons.addWidget(cancel_btn)
+        layout.addLayout(buttons)
+
+        if font is not None:
+            for w in (title, self.btn_hex, self.btn_rgb, self.btn_swap,
+                      self.bg_edit, self.ac_edit, self.preview, self.hint,
+                      save_btn, cancel_btn):
+                w.setFont(font)
+        self.bg_edit.textChanged.connect(self._refresh)
+        self.ac_edit.textChanged.connect(self._refresh)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        for child in self.findChildren(QWidget):
+            child.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self._set_mode("hex")
+
+    def _apply_preset(self, bg, accent):
+        self.mode = "hex"
+        self.bg_edit.setText(bg)
+        self.ac_edit.setText(accent)
+        self._set_mode("hex")
+
+    def _colour_row(self, label, edit, swatch):
+        row = QHBoxLayout()
+        name = QLabel(label)
+        name.setMinimumWidth(90)
+        row.addWidget(name)
+        row.addWidget(edit, 1)
+        row.addWidget(swatch)
+        return row
+
+    def _set_mode(self, mode):
+        mode = "rgb" if mode == "rgb" else "hex"
+        if mode != self.mode:
+            old = self.mode
+            self.mode = old
+            bg = self._parse(self.bg_edit.text()) or "#000000"
+            accent = self._parse(self.ac_edit.text()) or "#FFFFFF"
+            self.mode = mode
+            if mode == "rgb":
+                self.bg_edit.setText(self._hex_to_csv(bg))
+                self.ac_edit.setText(self._hex_to_csv(accent))
+            else:
+                self.bg_edit.setText(bg)
+                self.ac_edit.setText(accent)
+        self.mode = mode
+        self.btn_hex.setEnabled(mode != "hex")
+        self.btn_rgb.setEnabled(mode != "rgb")
+        if mode == "hex":
+            self.bg_edit.setPlaceholderText("#RRGGBB")
+            self.ac_edit.setPlaceholderText("#RRGGBB")
+            self.hint.setText("HEX  #RRGGBB")
+        else:
+            self.bg_edit.setPlaceholderText("R,G,B")
+            self.ac_edit.setPlaceholderText("R,G,B")
+            self.hint.setText("RGB  R,G,B    0-255")
+        self._refresh()
+
+    def _swap(self):
+        bg = self.bg_edit.text()
+        self.bg_edit.setText(self.ac_edit.text())
+        self.ac_edit.setText(bg)
+
+    @staticmethod
+    def _hex_to_csv(hex_color):
+        h = str(hex_color or "#000000").lstrip("#")
+        try:
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+        except (ValueError, IndexError):
+            r = g = b = 0
+        return f"{r},{g},{b}"
+
+    def _parse(self, text):
+        text = (text or "").strip()
+        if self.mode == "rgb":
+            parts = [p.strip() for p in text.replace(" ", "").split(",") if p.strip() != ""]
+            if len(parts) != 3:
+                return None
+            try:
+                nums = [int(p) for p in parts]
+            except ValueError:
+                return None
+            if any(n < 0 or n > 255 for n in nums):
+                return None
+            return "#{:02X}{:02X}{:02X}".format(*nums)
+        if not text.startswith("#"):
+            text = "#" + text
+        hexdigits = set("0123456789abcdefABCDEF")
+        if len(text) == 7 and all(ch in hexdigits for ch in text[1:]):
+            return text.upper()
+        return None
+
+    def _refresh(self):
+        bg = self._parse(self.bg_edit.text())
+        accent = self._parse(self.ac_edit.text())
+        bg_show = bg or "#333333"
+        ac_show = accent or "#888888"
+        self.bg_swatch.setStyleSheet(
+            f"background-color: {bg_show}; border: 1px solid #FFFFFF; min-width: 72px;")
+        self.ac_swatch.setStyleSheet(
+            f"background-color: {ac_show}; border: 1px solid #FFFFFF; min-width: 72px;")
+        self.preview.setText("e.g.  Themes                         [Custom]" if bg and accent else "Bad colour")
+        self.preview.setStyleSheet(
+            f"background-color: {bg_show}; color: {ac_show}; border: 1px solid #FFFFFF;")
+
+    def _save(self):
+        bg = self._parse(self.bg_edit.text())
+        accent = self._parse(self.ac_edit.text())
+        if not bg or not accent:
+            self.hint.setText("Need a valid HEX or RGB colour")
+            return
+        self.result_bg = bg
+        self.result_accent = accent
+        self.accept()
+
+
 # ---------- main window ----------
 class MusicRoom(QMainWindow):
     THEMES = [
@@ -1277,7 +1466,7 @@ class MusicRoom(QMainWindow):
         self.settings_list.setParent(self.bios_root)
         self.settings_list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         lay.addWidget(self.settings_list, 1)
-        self.bios_hint = QLabel("←/→ Page    ↑/↓ Move    Enter Edit    Esc Back")
+        self.bios_hint = QLabel("←/→ Page    ↑/↓ Move    Enter    Esc/F7 Back")
         self.bios_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(self.bios_hint)
 
@@ -1322,7 +1511,7 @@ class MusicRoom(QMainWindow):
         form.addWidget(self.bios_cancel_btn)
         self.bios_form.hide()
         el.addWidget(self.bios_form)
-        self.bios_editor_hint = QLabel("Enter apply    Esc back")
+        self.bios_editor_hint = QLabel("Enter apply    Esc/F7 back")
         self.bios_editor_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         el.addWidget(self.bios_editor_hint)
         self.settings_list.installEventFilter(self)
@@ -1385,7 +1574,7 @@ class MusicRoom(QMainWindow):
         self.update_settings_list()
 
     def _settings_key(self, key):
-        if key == Qt.Key.Key_Escape:
+        if key in (Qt.Key.Key_Escape, Qt.Key.Key_F7):
             if self.bios_editor.isVisible():
                 self._close_bios_editor()
             else:
@@ -1420,10 +1609,10 @@ class MusicRoom(QMainWindow):
                     self._close_bios_editor()
                     return True
             if obj is self.settings_list and not self.bios_editor.isVisible():
-                if key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Escape):
+                if key in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Escape, Qt.Key.Key_F7):
                     self._settings_key(key)
                     return True
-            if obj is self.bios_editor_list and key == Qt.Key.Key_Escape:
+            if obj is self.bios_editor_list and key in (Qt.Key.Key_Escape, Qt.Key.Key_F7):
                 self._close_bios_editor()
                 return True
         return super().eventFilter(obj, event)
@@ -1453,7 +1642,7 @@ class MusicRoom(QMainWindow):
                 ("audio_source", "Audio Level Source", self.audio_level_source),
                 ("audio_mode", "Audio Level Mode", self.audio_level_mode),
             ]),
-            ("Display", [
+            ("Preference", [
                 ("background", "Background", bg_state),
                 ("aero", "Aero Opacity", f"{getattr(self, 'aero_opacity', 40)}%"),
                 ("bg_image", "Background Image", "pick"),
@@ -1546,8 +1735,9 @@ class MusicRoom(QMainWindow):
             self.pick_background_image()
             self.update_settings_list()
         elif sid == "bg_clear":
-            self.clear_background_image()
-            self.update_settings_list()
+            self._confirm_clear(
+                "Clear the custom background image?",
+                self.clear_background_image)
         elif sid == "duration":
             self.show_duration = not self.show_duration
             self._save_settings()
@@ -1579,18 +1769,10 @@ class MusicRoom(QMainWindow):
             if not (0 <= idx < len(self.source_paths)):
                 return
             removed = self.source_paths[idx]
-            reply = QMessageBox.question(
-                self, "Confirm Removal",
+            self._confirm_clear(
                 f"Remove this music folder from the list?\n\n{removed}\n\n"
-                "(Removed from the list only. Files on disk are NOT deleted.)",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if reply == QMessageBox.StandardButton.Yes:
-                self.source_paths.pop(idx)
-                self._save_playlist()
-                self.track_status.setText(f"Removed: {removed}")
-                log(f"[Settings] Removed source folder: {removed}", 20)
-            self.update_settings_list()
+                "Files on disk are NOT deleted.",
+                lambda i=idx: self._do_remove_folder(i))
         elif sid == "refresh":
             self.refresh_current_directory()
             self.track_status.setText("File list refreshed")
@@ -1616,13 +1798,29 @@ class MusicRoom(QMainWindow):
             self.show_about_dialog()
 
     def _confirm_clear(self, question, fn):
-        reply = QMessageBox.question(
-            self, "Confirm", question,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Warning")
+        box.setText(question)
+        box.setInformativeText("This cannot be undone.\nPress Yes to delete. Press No to keep it.")
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        yes = box.button(QMessageBox.StandardButton.Yes)
+        if yes is not None:
+            yes.setText("Yes")
+        if self.is_always_on_top:
+            box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        if box.exec() == QMessageBox.StandardButton.Yes:
             fn()
         self.update_settings_list()
+
+    def _do_remove_folder(self, idx):
+        if not (0 <= idx < len(self.source_paths)):
+            return
+        removed = self.source_paths.pop(idx)
+        self._save_playlist()
+        self.track_status.setText(f"Removed: {removed}")
+        log(f"[Settings] Removed source folder: {removed}", 20)
 
     def _do_clear_history(self):
         self.history_paths = []
@@ -1655,7 +1853,7 @@ class MusicRoom(QMainWindow):
         self.bios_text.hide()
         self.bios_editor_list.show()
         self.bios_editor_title.setText(title)
-        self.bios_editor_hint.setText("↑/↓ Move    Enter apply    Esc back")
+        self.bios_editor_hint.setText("↑/↓ Move    Enter apply    Esc/F7 back")
         self.bios_editor_list.clear()
         selected = 0
         for i, (label, payload) in enumerate(rows):
@@ -1685,7 +1883,7 @@ class MusicRoom(QMainWindow):
         self.bios_editor_list.hide()
         self.bios_text.show()
         self.bios_editor_title.setText(title)
-        self.bios_editor_hint.setText("Esc back")
+        self.bios_editor_hint.setText("Esc/F7 back")
         self.bios_text.setPlainText(text or "")
         self.bios_editor.show()
         self._place_bios_editor()
@@ -1751,18 +1949,28 @@ class MusicRoom(QMainWindow):
         return f"Custom {n:02d}"
 
     def _open_theme_form(self):
-        self._bios_kind = "theme_form"
-        self.bios_editor_list.hide()
-        self.bios_text.hide()
-        self.bios_form.show()
-        self.bios_editor_title.setText("Add Colour")
-        self.bios_editor_hint.setText("← HEX   → RGB    Enter save    Esc back")
-        self._set_theme_input_mode("hex")
-        self.theme_bg.setText("#000000")
-        self.theme_accent.setText("#FFFFFF")
-        self.bios_editor.show()
-        self._place_bios_editor()
-        self.theme_bg.setFocus()
+        dlg = ColourDialog(self, self.dos_font)
+        if self.is_always_on_top:
+            dlg.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        bg = dlg.result_bg
+        accent = dlg.result_accent
+        if not bg or not accent:
+            return
+        name = self._next_theme_name()
+        self.custom_themes.append({"name": name, "bg": bg, "accent": accent})
+        self.custom_themes = self.custom_themes[:24]
+        self.current_theme_index = len(self.THEMES) + len(self.custom_themes) - 1
+        picked = self._theme_tuple()
+        self.bg_color = picked[1]
+        self.accent_color = picked[2]
+        self.apply_theme()
+        self._save_settings()
+        self.track_status.setText(f"Colour saved: {name}")
+        log(f"[Settings] custom theme {name} {bg} {accent}", 20)
+        self._close_bios_editor()
+        self.update_settings_list()
 
     def _save_custom_theme(self):
         bg = self._parse_colour(self.theme_bg.text())
@@ -2651,32 +2859,17 @@ class MusicRoom(QMainWindow):
 
     def toggle_settings_page(self):
         if self.show_settings:
-            resume = self._settings_resume_track
-            self._settings_resume_track = None
             self._close_bios_editor()
             if getattr(self, "bios_root", None) is not None:
                 self.bios_root.hide()
             self.left_stack.setCurrentIndex(0)
             self.show_settings = False
             self.file_list.setFocus()
-            if resume and self.current_file_path:
-                self.play_file(resume)
         else:
             if self.window_mode in (2, 3):
                 return
             if self.search_input.hasFocus():
                 self.search_input.clearFocus()
-            playing = False
-            try:
-                playing = bool(self.audio_engine.is_playing())
-            except Exception:
-                playing = False
-            self._settings_resume_track = None
-            if playing and self.current_track_info:
-                self._settings_resume_track = self.current_track_info
-            self.stop_current_engine()
-            self._set_keep_awake(False)
-            self.track_status.setText("Stopped")
             self.show_settings = True
             self._place_bios()
             self.bios_root.show()
@@ -2725,6 +2918,10 @@ class MusicRoom(QMainWindow):
             self.show_source_list()
             self.set_normal_mode()
         self.file_list.setFocus()
+        self.current_theme_index = 0
+        self.bg_color = self.THEMES[0][1]
+        self.accent_color = self.THEMES[0][2]
+        self.apply_theme()
         self._save_settings()
 
     def cycle_window_mode(self):
