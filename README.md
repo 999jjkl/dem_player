@@ -187,8 +187,6 @@ Settings page:
 | `Enter` (in a choice list) | Apply the selected value |
 | `←` / `→` (while editing a custom theme) | Switch HEX ⇄ RGB input mode |
 
-**About dialog easter egg:** while the About dialog is open, enter the Konami code (`↑↑↓↓←→←→BA`) — a pixel ball starts bouncing around the text area.
-
 ---
 
 ## Settings Overview
