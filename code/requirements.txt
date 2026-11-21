@@ -1,0 +1,7 @@
+PySide6>=6.6
+miniaudio>=1.59
+mutagen>=1.47
+numpy>=1.26
+sounddevice>=0.4
+# optional MIDI via Python bindings; CLI fluidsynth.exe is preferred
+pyfluidsynth>=1.3
