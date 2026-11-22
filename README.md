@@ -2,7 +2,7 @@
 
 A keyboard-first, frameless music player for Windows. Python + PySide6.
 
-It is a small desktop player: fast keys, a lot of formats (including tracker modules and chiptunes), themes, and a borderless window.
+It is a small desktop player: fast keys, a lot of formats (including tracker modules, chiptunes, and PC-98 MML), themes, and a borderless window.
 
 ---
 
@@ -12,24 +12,28 @@ It is a small desktop player: fast keys, a lot of formats (including tracker mod
 
 - **One window** — a second launch sends the file to the window that is already open.
 - **Keys first** — almost everything is a key. The mouse drags the window, and is used in the Add Colour window and in warning dialogs.
-- **Several decoders** — miniaudio, then FFmpeg, OpenMPT, FluidSynth, Furnace, ASAP, ZXTune.
+- **Several decoders** — miniaudio, then FFmpeg, OpenMPT, FluidSynth, Furnace, ASAP, ZXTune, and the PC-98 MML tools.
 
 ---
 
 ## Features
 
 - File browser, CUE tracks, M3U (UTF-8 / UTF-16 / GBK), stream URLs
-- Favorites: lists `001`–`512`, each can be exported as M3U
+- Favorites: lists `001`–`512`, each can be exported as M3U. Skipped tracks are stored on the playlist, not in settings
 - History: last 100 paths
 - Play counts, and a Most Played view
-- Metadata and cover art when `mutagen` is installed
+- Random does not repeat the last fifth of the playlist until the rest has played
+- Metadata and cover art when `mutagen` is installed. Artist, album, and track number can be hidden
 - 16 built-in themes, plus up to 24 colours you add
 - Background: `transparent`, `aero`, `solid`, or `image`
-- Audio level from the file, or from the system (`sounddevice`)
+- Audio level from the file, or from the system (`sounddevice`). The meter still moves when volume is 0
+- Sample rate, bit depth, and channels. If the file is lower than the setting, the file’s own format is used
+- One, two, or three outputs at the same time
 - Window modes: Normal, Fullscreen, Mini, Bar
 - Output device picker
 - Drag and drop files or folders
 - Windows “Open with”, without becoming the default player
+- Log file keeps every level, including exceptions that Python would otherwise only show in a dialog
 - Old data files are migrated on startup
 
 Opening Settings does **not** stop the song. Mini and Bar cannot open Settings.
@@ -47,6 +51,7 @@ Opening Settings does **not** stop the song. Mini and Bar cannot open Settings.
 | **Furnace** | `.dnm` `.ftm` |
 | **ASAP** | `.sap` `.tm8` `.tm2` and other Atari 8-bit files |
 | **ZXTune** | `.sid` `.vgm` `.vgz` |
+| **PMD / MUCOM** | `.mml` `.m` `.m2` `.mz` `.mub` `.muc` `.gwi` `.mdx` (PC-98 / PC-88, needs the sidecar tools) |
 | **CUE** | `.cue` `.cue.txt` |
 
 If a tool is missing, that format fails and the status line says so.
@@ -117,10 +122,16 @@ Qt WebEngine is not packed. `ffmpeg.exe` and the SoundFont are copied by `build.
 | `furnace.exe` | DNM / FTM |
 | `asapconv.exe` | SAP and related |
 | `zxtune123.exe` or `zxtune-cli.exe` | SID / VGM / VGZ |
+| `mml\compiler` and `mml\player` | PMD `.m` / `.m2` / `.mz`. `.m2` is the PC-98-86 file; the player copies it to `.m` and uses `-B=86`. |
+| `bin1\NET6\mucomDotNETConsole.exe` and `mucomDotNET2wav.exe` | MUCOM |
+| `bin2\mml2vgmx64\mvcx64.exe` plus `zxtune123.exe` | mml2vgm / `.gwi` |
+| `mml2mdx.exe` plus `zxtune123.exe` | MXDRV |
 | `font.ttf` | UI font, or Courier New |
 | `FPT.ico` | window and tray icon |
 | `background.png` | built-in background |
 | `Background\custom_background.png` | your background (the app writes this) |
+
+An `.mml` file is scored from its text (PMD, MUCOM, mml2vgm, MXDRV). The player tries that dialect first, then the others, and plays the first one that writes a WAV.
 
 Downloads:
 
@@ -141,10 +152,10 @@ These programs are **not** part of dem_player. Keep their own license files when
 | File | Holds |
 |---|---|
 | `data\settings.dpj` | theme, volume, folders, custom colours |
-| `data\play_list.dpj` | source folders and favorites |
+| `data\play_list.dpj` | source folders, favorites, and skipped tracks |
 | `data\play_history.dpj` | last 100 tracks and play counts |
 | `data\cache.dpj` | scanned durations |
-| `data\logs\` | one log per session, if Log Save is on |
+| `data\logs\` | one log per session, if Log Save is on. DEBUG, INFO, WARN, ERROR, and ignored callback exceptions are all written |
 
 Delete `cache.dpj`, or use **Clear Duration Cache**, to scan durations again.
 
@@ -166,6 +177,7 @@ Delete `cache.dpj`, or use **Clear Duration Cache**, to scan durations again.
 | `F8` | search |
 | `F9` | add to favorites, or remove if you are inside that list |
 | `F10` | scan durations in the open folder |
+| `F11` | mark or unmark the selected track as skipped. List and Random will pass it |
 | `Esc` | reset the player, and set the theme to Black & White |
 | `←` `→` | seek −1 s / +1 s |
 
@@ -189,8 +201,8 @@ Yes/No rows flip on Enter. Clear, reset, and remove-folder ask in a warning wind
 ## Settings pages
 
 1. **General** — always on top, screensaver while playing, themes, time format
-2. **Audio** — output device, audio level, source (`file` / `system`), mode (`all` / `volume`)
-3. **Preference** — background, aero opacity, background image, duration, cover, play counts
+2. **Audio** — output device, output count (1 / 2 / 3), sample rate, bit depth, channels, audio level, source (`file` / `system`), mode (`all` / `volume`)
+3. **Preference** — background, aero opacity, background image, duration, artist / album / track number, cover, play counts
 4. **Library** — add or remove a music folder, refresh, scan durations
 5. **Options** — log, Open with, clear history / counts / favorites / cache, reset, About
 
@@ -251,6 +263,7 @@ ffmpeg, Furnace, ASAP, FluidSynth, OpenMPT, and ZXTune that you download stay un
 | mutagen | GPL-2.0-or-later |
 | numpy | BSD-3-Clause |
 | sounddevice | MIT |
+| pyfluidsynth | LGPL-2.1+ (optional; the FluidSynth program is preferred) |
 | FFmpeg | GPL or LGPL, depending on the build you download |
 | libopenmpt | BSD-3-Clause |
 | FluidSynth | LGPL-2.1 |
@@ -264,6 +277,9 @@ ffmpeg, Furnace, ASAP, FluidSynth, OpenMPT, and ZXTune that you download stay un
 
 I was playing *Touhou 5: Mystic Square* and liked the Music Room, so I made a small keyboard player in that shape.
 
+ReadMe and LICENSE is use AI make 
+If you find any bugs or issues, please let us know.
+
 ---
 
 # 繁體中文
@@ -274,20 +290,23 @@ I was playing *Touhou 5: Mystic Square* and liked the Music Room, so I made a sm
 
 - 已經開著再開一次，檔案會交給同一個視窗。
 - 幾乎全部用鍵盤。滑鼠用來拖視窗；加顏色那個視窗、以及清除前的警告，才用滑鼠。
-- 格式會自己交給 miniaudio、FFmpeg、OpenMPT、FluidSynth、Furnace、ASAP 或 ZXTune。
+- 格式會自己交給 miniaudio、FFmpeg、OpenMPT、FluidSynth、Furnace、ASAP、ZXTune，或 PC-98 的 MML 工具。
 
 ## 功能
 
 - 資料夾、M3U、CUE、串流網址
-- 收藏 `001`–`512`，可匯出 M3U
+- 收藏 `001`–`512`，可匯出 M3U。略過的歌記在播放清單，不在設定裡
 - 最近 100 首、播放次數
-- 有 mutagen 才讀歌名、專輯、封面
+- 隨機播放不會立刻重播清單裡最近約五分之一的歌
+- 有 mutagen 才讀歌名、專輯、封面。歌手、專輯、曲號可以關掉
 - 16 個內建主題，自己最多再加 24 個顏色
 - 背景：`transparent` / `aero` / `solid` / `image`
 - 音量條可以跟檔案，也可以跟系統聲音。音量開到 0 仍然會動
+- 可設取樣率、位元、聲道。檔案本身比較低就用檔案的
+- 可以同時輸出到 1、2 或 3 個裝置
 - 四種視窗：Normal、Fullscreen、Mini、Bar
-- 可選輸出裝置
 - 「用這個程式開啟」不會搶走預設播放器
+- 日誌會寫下所有等級，包括平時只彈窗、不會進檔案的異常
 - 舊的設定檔會自動搬過來
 - 進入設定時歌不會停。Mini 和 Bar 不能開設定
 
@@ -302,6 +321,7 @@ I was playing *Touhou 5: Mystic Square* and liked the Music Room, so I made a sm
 | Furnace | `.dnm` `.ftm` |
 | ASAP | `.sap` `.tm8` `.tm2` 等 |
 | ZXTune | `.sid` `.vgm` `.vgz` |
+| PMD / MUCOM | `.mml` `.m` `.m2` `.mz` `.mub` `.muc` `.gwi` `.mdx`（要另外放工具） |
 | CUE | `.cue` `.cue.txt` |
 
 ## 怎樣行
@@ -339,6 +359,7 @@ build.bat
 | `F8` | 搜尋 |
 | `F9` | 加入或移出收藏 |
 | `F10` | 掃描這個資料夾的時長 |
+| `F11` | 把選中的歌標成略過，或取消。清單和隨機播放會跳過它 |
 | `Esc` | 重設播放器，並把主題改回 Black & White |
 | `←` `→` | 前後 1 秒 |
 
@@ -353,8 +374,8 @@ Mini 不能用 `F4`、`F8`。Mini 和 Bar 不能用 `F7`。
 ## 設定五頁
 
 1. **General** — 永遠在最前、播放時允許螢幕保護、主題、時間格式
-2. **Audio** — 輸出裝置、音量條、來源、模式
-3. **Preference** — 背景、Aero 透明度、背景圖、時長、封面、播放次數
+2. **Audio** — 輸出裝置、同時輸出 1／2／3 個、取樣率、位元、聲道、音量條、來源、模式
+3. **Preference** — 背景、Aero 透明度、背景圖、時長、歌手／專輯／曲號、封面、播放次數
 4. **Library** — 加入或移除資料夾、重新整理、掃描時長
 5. **Options** — 日誌、「用這個程式開啟」、清除、重設、About
 
@@ -370,8 +391,3 @@ Qt 是 LGPL-3，不能配「只准 GPL-2」。mutagen 寫明第 2 版或更新�
 
 你另外下載的 ffmpeg、Furnace、ASAP、FluidSynth、OpenMPT、ZXTune **不是**這個授權能改寫的，那些檔要保留它們自己的授權。
 
-## 為什麼做這個
-
-玩《東方怪綺談》的時候很喜歡 Music Room，所以做了一個鍵盤為主的小播放器。
-
-*this readme use ai
